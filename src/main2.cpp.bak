@@ -1,0 +1,579 @@
+/*
+  Pêndulo invertido com roda de reação — controle em malha fechada
+  Motor:    Gimbal 2804 (12N14P -> 7 pares de polos)
+  Encoder:  AS5600 (I2C bus 0 / Wire), no EIXO DO MOTOR/RODA
+  IMU:      GY-521 / MPU6050 (I2C bus 1 / Wire1), fixado na HASTE
+  Driver:   SimpleFOCmini (DRV8313, 3PWM)
+  Placa:    ESP32 Doit DevKit V1
+  Build:    PlatformIO (env esp32doit-devkit-v1 em platformio.ini)
+  Telemetria e comandos: Bluetooth Classic (SPP), sem fio ao notebook
+
+  CONVENÇÃO DE EIXOS DO GY-521 (ver explicação completa na resposta)
+  --------------------------------------------------------------------
+  O GY-521 é fixado à HASTE com o plano da placa alinhado ao PLANO DE
+  OSCILAÇÃO do pêndulo, e o eixo Z do sensor apontando para FORA desse
+  plano, paralelo ao eixo de rotação do pivô.
+    - Ângulo da haste em relação à vertical: angle = atan2(ax, ay)
+    - Velocidade angular correspondente:     gz (°/s)
+  Se o sinal medido vier invertido no seu teste (a haste cai para um
+  lado mas o ângulo soma no sentido errado), troque ANGLE_SIGN ou
+  GYRO_SIGN de +1.0f para -1.0f logo abaixo.
+
+  MODOS (trocar via Bluetooth, comando "M0" ou "M1")
+  --------------------------------------------------------------------
+  M0 = teste em malha aberta (onda quadrada de tensão), como antes.
+  M1 = balanceamento por PID usando o ângulo do GY-521 (padrão).
+
+  COMANDOS BLUETOOTH (digite no app de terminal serial BT, Enter após):
+    A<valor>  amplitude da onda quadrada no modo M0 (V)
+    P<valor>  período da onda quadrada no modo M0 (ms)
+    M<0 ou 1> troca de modo
+    K<valor>  Kp do PID
+    I<valor>  Ki do PID
+    D<valor>  Kd do PID
+    S<valor>  setpoint do PID, em graus (0 = vertical)
+    R         inverte o sentido do torque do motor (alterna +1/-1)
+    L<seg>    pede o log por <seg> segundos (ex.: L10). "L" sozinho = 5 s, L0 para.
+              (o log NÃO é mais automático)
+    F         formato do log: F1 = CSV (planilha), F0 = texto legível, "F" alterna
+    T<hz>     taxa do log (1 a 50 Hz)
+    B         calibra o offset do giroscópio (haste PARADA, 2 s, motor desligado)
+    Q         mostra parâmetros atuais, taxa do loop e motivo do último reset
+    H         legenda de cada coluna do log + lista de comandos
+    J<volts>  limite do termo integral (padrão 1, máx. 4)
+    X<volts>  kick de partida: recua a roda e inverte para pegar o pico de torque (X0 desliga)
+    V<volts>  limite de tensão do motor/PID (padrão 4, máx. 8). Suba aos poucos.
+    Z         setpoint = ângulo atual (segure a haste no ponto de equilíbrio antes)
+
+  AVISO: BluetoothSerial (SPP clássico) conecta com Android normalmente
+  via apps como "Serial Bluetooth Terminal". iPhone/iOS não suporta SPP
+  clássico com apps genéricos — se for usar iOS, me avise para trocar
+  para BLE.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SimpleFOC.h>
+#include "BluetoothSerial.h"
+#include <esp_system.h>   // esp_reset_reason()
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth não habilitado no build. Rode `idf.py menuconfig`/verifique o framework ESP32 Arduino.
+#endif
+
+// ---------- Pinos do driver (SimpleFOCmini) ----------
+// Evita strapping pins (0,2,12,15), flash SPI (6-11) e pinos só-entrada (34-39).
+#define PIN_PWM_A   25
+#define PIN_PWM_B   26
+#define PIN_PWM_C   27
+#define PIN_ENABLE  33
+
+// ---------- I2C bus 0: AS5600 no eixo do motor/roda ----------
+// Pinos padrão do ESP32 (Wire): SDA=21, SCL=22
+
+// ---------- I2C bus 1: GY-521/MPU6050 na haste ----------
+// Barramento separado (Wire1) para não compartilhar tráfego/colisões com o
+// encoder, que precisa de leitura rápida e constante para o FOC.
+#define MPU_SDA 16
+#define MPU_SCL 17
+#define MPU_ADDR 0x68
+
+// Alimentação
+#define SUPPLY_VOLTAGE 13.70f  // tensão da fonte do driver (dentro de 7.4-16V do motor)
+float VOLTAGE_LIMIT_MAX = 4.0f;   // ajustável em tempo real pelo comando V (máx. 8 V) // trava de segurança (não passe disso sem revisar o motor)
+
+// ---------- Hardware: motor/driver/encoder ----------
+BLDCMotor motor = BLDCMotor(7);                     // 2804 12N14P -> 7 pares de polos
+BLDCDriver3PWM driver = BLDCDriver3PWM(PIN_PWM_A, PIN_PWM_B, PIN_PWM_C, PIN_ENABLE);
+MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
+
+// ---------- Bluetooth (substitui o Serial para telemetria/comandos) ----------
+// ---- "Kick" de partida (comando X): recua a roda e depois inverte para pegar o pico de torque ----
+// Dispara quando a haste fica parada (|gz| < KICK_GZ_DPS) com erro grande (> KICK_ERR_DEG) por KICK_WAIT_MS.
+#define KICK_ERR_DEG     3.0f
+#define KICK_GZ_DPS      5.0f
+#define KICK_WAIT_MS     300
+#define KICK_T1_MS       120    // fase 1: gira a roda para o lado OPOSTO ao da subida
+#define KICK_T2_MS       200    // fase 2: inverte para o lado da subida (pico de torque)
+#define KICK_COOLDOWN_MS 600
+#define TELEM_HZ 20   // taxa do log via Bluetooth (Hz). Suba para 50 só se o app aguentar.
+BluetoothSerial SerialBT;
+Commander command = Commander(SerialBT);
+
+// ============================================================
+//  Driver mínimo do MPU6050, em Wire1 (bus I2C separado)
+// ============================================================
+#define MPU_REG_PWR_MGMT_1   0x6B
+#define MPU_REG_ACCEL_CONFIG 0x1C
+#define MPU_REG_GYRO_CONFIG  0x1B
+#define MPU_REG_CONFIG       0x1A
+// Filtro digital do MPU6050 (reduz vibração do motor no acelerômetro/giro):
+// 0 = desligado (260 Hz) | 1 = 184 Hz | 2 = 94 Hz | 3 = 44 Hz | 4 = 21 Hz
+#define MPU_DLPF_CFG 3
+#define MPU_REG_ACCEL_XOUT_H 0x3B
+
+const float ACCEL_SENS = 16384.0f; // LSB/g   (faixa ±2g, default)
+float gyro_bias_z = 0;             // °/s, offset do giro Z (comando B calibra)
+const float GYRO_SENS  = 131.0f;   // LSB/°/s (faixa ±250°/s, default)
+
+bool mpuWriteReg(uint8_t reg, uint8_t val) {
+  Wire1.beginTransmission(MPU_ADDR);
+  Wire1.write(reg);
+  Wire1.write(val);
+  return Wire1.endTransmission() == 0;
+}
+
+bool mpuInit() {
+  Wire1.begin(MPU_SDA, MPU_SCL, 400000);
+  bool ok = true;
+  ok &= mpuWriteReg(MPU_REG_PWR_MGMT_1, 0x00);   // sai do modo sleep
+  delay(50);
+  ok &= mpuWriteReg(MPU_REG_ACCEL_CONFIG, 0x00); // força ±2g
+  ok &= mpuWriteReg(MPU_REG_CONFIG, MPU_DLPF_CFG);   // filtro digital (ver MPU_DLPF_CFG)
+  ok &= mpuWriteReg(MPU_REG_GYRO_CONFIG, 0x00);  // força ±250°/s
+  return ok;
+}
+
+struct MpuSample {
+  float ax, ay, az;  // g
+  float gx, gy, gz;  // °/s
+  bool  ok;
+};
+
+MpuSample mpuRead() {
+  MpuSample s{0, 0, 0, 0, 0, 0, false};
+  Wire1.beginTransmission(MPU_ADDR);
+  Wire1.write(MPU_REG_ACCEL_XOUT_H);
+  if (Wire1.endTransmission(false) != 0) return s;
+  uint8_t n = Wire1.requestFrom((int)MPU_ADDR, 14, (int)true);
+  if (n < 14) return s;
+
+  int16_t raw_ax = (Wire1.read() << 8) | Wire1.read();
+  int16_t raw_ay = (Wire1.read() << 8) | Wire1.read();
+  int16_t raw_az = (Wire1.read() << 8) | Wire1.read();
+  Wire1.read(); Wire1.read();   // temperatura (descartada)
+  int16_t raw_gx = (Wire1.read() << 8) | Wire1.read();
+  int16_t raw_gy = (Wire1.read() << 8) | Wire1.read();
+  int16_t raw_gz = (Wire1.read() << 8) | Wire1.read();
+
+  s.ax = raw_ax / ACCEL_SENS;
+  s.ay = raw_ay / ACCEL_SENS;
+  s.az = raw_az / ACCEL_SENS;
+  s.gx = raw_gx / GYRO_SENS;
+  s.gy = raw_gy / GYRO_SENS;
+  s.gz = raw_gz / GYRO_SENS - gyro_bias_z;
+  s.ok = true;
+  return s;
+}
+
+// ============================================================
+//  Estimativa de ângulo: filtro complementar (acelerômetro + giro)
+// ============================================================
+#define ANGLE_SIGN 1.0f   // troque para -1.0f se o ângulo sair invertido
+#define GYRO_SIGN  1.0f   // troque para -1.0f se a taxa sair invertida
+
+float angle_est = 0;              // rad, ângulo filtrado da haste
+unsigned long t_prev_imu = 0;
+const float ALPHA_COMP = 0.98f;   // peso do giroscópio no filtro complementar
+
+void updateAngle(const MpuSample &s) {
+  unsigned long now = micros();
+  float dt = (t_prev_imu == 0) ? 0.001f : (now - t_prev_imu) * 1e-6f;
+  t_prev_imu = now;
+
+  float angle_accel    = ANGLE_SIGN * atan2(s.ax, s.ay);     // rad, só acelerômetro
+  float gyro_rate_rads = GYRO_SIGN * s.gz * DEG_TO_RAD;       // rad/s
+
+  // Giro para a dinâmica rápida, acelerômetro para corrigir o desvio (drift) do giro
+  angle_est = ALPHA_COMP * (angle_est + gyro_rate_rads * dt)
+            + (1.0f - ALPHA_COMP) * angle_accel;
+}
+
+// ============================================================
+//  PID de balanceamento
+// ============================================================
+float Kp = 3.0f, Ki = 2.0f, Kd = 0.18f;   // ponto de partida — precisa ser ajustado na bancada
+float setpoint_deg = 0.0f;                 // 0° = vertical
+float pid_integral = 0;                    // termo integral já em Volts (Ki incluso)
+unsigned long t_prev_pid = 0;
+const float SAFETY_ANGLE_DEG = 70.0f;      // acima disso, considera "caído" e desliga
+float I_MAX_V = 1.0f;   // ajustável pelo comando J                // limite do termo integral (anti-windup), em V
+// ---- Variáveis de depuração (preenchidas pelo PID, lidas pelo log) ----
+float dbg_err_deg = 0;      // erro = setpoint - ângulo (graus)
+float dbg_P = 0, dbg_I = 0, dbg_D = 0;   // contribuição de cada termo (V)
+float dbg_pre = 0;          // soma P+I+D ANTES de limitar (V)
+bool  dbg_sat = false;      // true se a saída foi cortada pelo limite de tensão
+bool  dbg_fallen = false;   // true se |ângulo| > SAFETY_ANGLE_DEG (PID desligado)
+float loop_hz = 0;          // voltas do loop() por segundo
+uint32_t mpu_falhas = 0;    // leituras do MPU que falharam
+bool  fmt_csv = true;       // formato do log: true = CSV, false = texto legível
+float telem_hz = TELEM_HZ;  // taxa do log (Hz)
+const char* reset_motivo = "?";
+uint32_t log_ate_ms = 0;    // fim do log pedido (comando L)
+bool     log_ativo  = false;
+float    kick_V     = 0;    // tensão do kick (V). 0 = desligado (comando X)
+// calibração do offset do giroscópio (comando B)
+bool bias_cal = false; double bias_soma = 0; uint32_t bias_cnt = 0, bias_fim_ms = 0;
+
+const char* resetReasonStr() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power-on (ligou a energia)";
+    case ESP_RST_EXT:       return "pino EN / reset externo";
+    case ESP_RST_SW:        return "software (ESP.restart)";
+    case ESP_RST_PANIC:     return "PANIC / excecao (crash do codigo)";
+    case ESP_RST_INT_WDT:   return "watchdog de interrupcao";
+    case ESP_RST_TASK_WDT:  return "watchdog de tarefa";
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT (queda de tensao na alimentacao)";
+    default:                return "outro / desconhecido";
+  }
+}
+
+float dir_motor = 1.0f;                    // +1 / -1: sentido do torque (comando R inverte)
+
+void resetPID() {
+  pid_integral = 0;
+  t_prev_pid = 0;
+}
+
+float computePID(float angle_rad, float gyro_rate_rads) {
+  unsigned long now = micros();
+  float dt = (t_prev_pid == 0) ? 0.005f : (now - t_prev_pid) * 1e-6f;
+  t_prev_pid = now;
+  dt = constrain(dt, 1e-4f, 0.05f);        // protege contra dt zero ou saltos grandes
+
+  if (fabs(angle_rad) * RAD_TO_DEG > SAFETY_ANGLE_DEG) {
+    pid_integral = 0;    // pêndulo caído: desliga e não acumula erro
+    dbg_fallen = true;
+    dbg_err_deg = setpoint_deg - angle_rad * RAD_TO_DEG;
+    dbg_P = dbg_I = dbg_D = dbg_pre = 0;
+    dbg_sat = false;
+    return 0;
+  }
+
+  float error = setpoint_deg * DEG_TO_RAD - angle_rad;
+  dbg_fallen  = false;
+  dbg_err_deg = error * RAD_TO_DEG;
+
+  // P
+  float upk = Kp * error;
+  dbg_P = upk;
+
+  // I com anti-windup: limitado a ±I_MAX_V e só integra se a saída não estiver saturada
+  // empurrando no mesmo sentido do erro
+  pid_integral += Ki * error * dt;
+  pid_integral = constrain(pid_integral, -I_MAX_V, I_MAX_V);
+
+  // D: usa a taxa do giroscópio (mais limpa que derivar o ângulo). d(erro)/dt = -taxa
+  float udk = Kd * (-gyro_rate_rads);
+  dbg_D = udk;
+
+  float output = upk + pid_integral + udk;
+  float sat = constrain(output, -VOLTAGE_LIMIT_MAX, VOLTAGE_LIMIT_MAX);
+  if (sat != output && (output * error) > 0) {
+    pid_integral -= Ki * error * dt;       // desfaz a integração se saturou a favor do erro
+  }
+
+  dbg_I   = pid_integral;
+  dbg_pre = output;
+  dbg_sat = (sat != output);
+  return dir_motor * sat;                  // dir_motor inverte o sentido do torque
+}
+
+// ============================================================
+//  Modo de teste em malha aberta (herdado do teste anterior)
+// ============================================================
+float amplitude_V = 1.0f;
+float periodo_ms  = 700;
+unsigned long t_ultima_troca = 0;
+int sentido = 1;
+
+// ============================================================
+//  Comandos Bluetooth
+// ============================================================
+float modo = 1.0f;   // 0 = onda quadrada (M0) | 1 = PID de balanceamento (M1)
+
+void onAmp(char* cmd)  { command.scalar(&amplitude_V, cmd); }
+void onPer(char* cmd)  { command.scalar(&periodo_ms, cmd); }
+void onModo(char* cmd) { command.scalar(&modo, cmd); resetPID(); }
+
+// R: inverte o sentido do torque do motor (use se ele reagir para o lado errado)
+void onInv(char* cmd) {
+  dir_motor = -dir_motor;
+  resetPID();
+  SerialBT.print("sentido motor: ");
+  SerialBT.println(dir_motor > 0 ? "normal (+1)" : "invertido (-1)");
+}
+
+void printHeader() {
+  SerialBT.println("t_ms,modo,ang_deg,ang_acc_deg,gz_dps,erro_deg,P_V,I_V,D_V,pid_V,saida_V,sat,caido,vel_roda_rads,ax_g,ay_g,az_g,clip,loop_hz,mpu_falhas");
+}
+
+// F: troca o formato do log. F1 = CSV (para planilha/gráfico), F0 = texto legível. "F" alterna.
+void onFmt(char* cmd) {
+  fmt_csv = (cmd == NULL || cmd[0] == '\0') ? !fmt_csv : (atof(cmd) > 0.5f);
+  SerialBT.println(fmt_csv ? "formato do log: CSV" : "formato do log: texto legivel");
+}
+
+// T<hz>: taxa do log (1..50 Hz)
+void onTelem(char* cmd) {
+  float v = (cmd != NULL) ? atof(cmd) : 0;
+  if (v >= 1.0f && v <= 50.0f) telem_hz = v;
+  SerialBT.printf("taxa do log: %.0f Hz\n", telem_hz);
+}
+
+// B: calibra o offset do giroscópio (haste PARADA). Motor desligado durante 2 s.
+void onBias(char* cmd) {
+  bias_soma = 0; bias_cnt = 0; bias_fim_ms = millis() + 2000; bias_cal = true;
+  resetPID();
+  SerialBT.println("calibrando bias do giro por 2 s: segure a haste PARADA (motor desligado)...");
+}
+
+// Q: mostra todos os parâmetros atuais
+void onStatus(char* cmd) {
+  SerialBT.printf("modo=M%d  sentido_motor=%+d  setpoint=%.2f deg\n", modo < 0.5f ? 0 : 1, (int)dir_motor, setpoint_deg);
+  SerialBT.printf("Kp=%.3f (= %.3f V por grau)  Ki=%.3f  Kd=%.3f\n", Kp, Kp * DEG_TO_RAD, Ki, Kd);
+  SerialBT.printf("limite_saida=%.1f V  I_MAX=%.1f V  corte_queda=%.0f deg  fonte=%.2f V\n",
+                  VOLTAGE_LIMIT_MAX, I_MAX_V, SAFETY_ANGLE_DEG, (float)SUPPLY_VOLTAGE);
+  SerialBT.printf("onda quadrada (M0): amp=%.2f V  periodo=%.0f ms\n", amplitude_V, periodo_ms);
+  SerialBT.printf("log: %s a %.0f Hz, %s\n", fmt_csv ? "CSV" : "texto", telem_hz, log_ativo ? "ATIVO" : "parado");
+  SerialBT.printf("loop=%.0f Hz  mpu_falhas=%lu  bias_gz=%.3f dps  DLPF=%d\n",
+                  loop_hz, (unsigned long)mpu_falhas, gyro_bias_z, (int)MPU_DLPF_CFG);
+  SerialBT.printf("ultimo reset: %s\n", reset_motivo);
+}
+
+// H: legenda do log e lista de comandos
+void onHelp(char* cmd) {
+  SerialBT.println("--- COLUNAS DO LOG (CSV) ---");
+  SerialBT.println("t_ms        tempo desde o boot (ms)");
+  SerialBT.println("modo        0 = onda quadrada, 1 = PID");
+  SerialBT.println("ang_deg     angulo da haste filtrado (graus, 0 = vertical) <- o que o PID usa");
+  SerialBT.println("ang_acc_deg angulo so do acelerometro (graus), compare com ang_deg");
+  SerialBT.println("gz_dps      velocidade angular da haste (graus/s), bias ja removido");
+  SerialBT.println("erro_deg    setpoint - ang_deg (graus)");
+  SerialBT.println("P_V I_V D_V contribuicao de cada termo do PID (V)");
+  SerialBT.println("pid_V       P+I+D antes de limitar (V)");
+  SerialBT.println("saida_V     tensao enviada ao motor (V, ja com limite e sentido R)");
+  SerialBT.println("sat         1 = pid_V foi cortado pelo limite de tensao");
+  SerialBT.println("caido       1 = |angulo| > corte, PID desligado");
+  SerialBT.println("vel_roda    velocidade da roda (rad/s)");
+  SerialBT.println("ax,ay,az    acelerometro (g). ay~+1 e ax~0 com a haste em pe");
+  SerialBT.println("clip        1 = acelerometro no fundo de escala (2 g)");
+  SerialBT.println("loop_hz     voltas do loop por segundo (ideal > 500)");
+  SerialBT.println("mpu_falhas  leituras do MPU que falharam");
+  SerialBT.println("--- COMANDOS ---");
+  SerialBT.println("M0/M1 modo | K I D ganhos | S setpoint | R inverte motor | A P onda quadrada");
+  SerialBT.println("L<seg> log (L0 para) | F formato | T<hz> taxa | B bias giro | Q status | H ajuda");
+}
+
+// L<seg>: pede o log por <seg> segundos (padrão 5). L0 para.
+void onLog(char* cmd) {
+  float seg = (cmd != NULL && cmd[0] != '\0') ? atof(cmd) : 5.0f;
+  if (seg <= 0) {
+    log_ativo = false;
+    SerialBT.println("log parado");
+    return;
+  }
+  if (fmt_csv) printHeader();
+  log_ate_ms = millis() + (uint32_t)(seg * 1000.0f);
+  log_ativo  = true;
+}
+void onKp(char* cmd)   { command.scalar(&Kp, cmd); }
+void onKi(char* cmd)   { command.scalar(&Ki, cmd); }
+void onKd(char* cmd)   { command.scalar(&Kd, cmd); }
+void onSet(char* cmd)  { command.scalar(&setpoint_deg, cmd); resetPID(); }
+
+// V<volts>: limite de tensão do motor (e da saída do PID). Máx. 8 V. Sem argumento só mostra.
+// Cuidado: mais tensão = mais corrente e aquecimento no 2804. Suba aos poucos.
+void onVolt(char* cmd) {
+  if (cmd != NULL && cmd[0] != '\0') {
+    VOLTAGE_LIMIT_MAX = constrain(atof(cmd), 0.0f, 8.0f);
+    motor.voltage_limit = VOLTAGE_LIMIT_MAX;
+  }
+  SerialBT.printf("limite de tensao = %.1f V (max permitido 8 V)\n", VOLTAGE_LIMIT_MAX);
+}
+
+// J<volts>: limite do termo integral (anti-windup). Padrão 1 V, máx. 4 V.
+void onImax(char* cmd) {
+  if (cmd != NULL && cmd[0] != '\0') I_MAX_V = constrain(atof(cmd), 0.0f, 4.0f);
+  SerialBT.printf("I_MAX = %.2f V\n", I_MAX_V);
+}
+
+// X<volts>: liga o kick de partida com essa tensão (X0 desliga).
+void onKick(char* cmd) {
+  if (cmd != NULL && cmd[0] != '\0') kick_V = constrain(atof(cmd), 0.0f, 8.0f);
+  if (kick_V > 0.01f) SerialBT.printf("kick LIGADO: %.1f V (limitado por V=%.1f)\n", kick_V, VOLTAGE_LIMIT_MAX);
+  else                SerialBT.println("kick desligado");
+}
+
+// Z: usa o ângulo ATUAL da haste como setpoint (segure a haste exatamente no ponto de equilíbrio)
+void onZero(char* cmd) {
+  setpoint_deg = angle_est * RAD_TO_DEG;
+  resetPID();
+  SerialBT.printf("setpoint = %.2f deg (angulo atual)\n", setpoint_deg);
+}
+
+void setup() {
+  Serial.begin(115200);   // só para debug via USB, se estiver plugado
+  reset_motivo = resetReasonStr();
+  Serial.printf("Motivo do ultimo reset: %s\n", reset_motivo);
+  SerialBT.begin("ESP32_Pendulo");
+  delay(300);
+
+  // Encoder AS5600 (I2C bus 0, pinos padrão 21/22)
+  Wire.begin();
+  sensor.init();
+  motor.linkSensor(&sensor);
+
+  // GY-521 (I2C bus 1, pinos 16/17)
+  if (!mpuInit()) {
+    SerialBT.println("AVISO: falha ao iniciar o MPU6050 (verifique fiação/endereço 0x68).");
+  }
+
+  // Driver
+  driver.voltage_power_supply = SUPPLY_VOLTAGE;
+  driver.voltage_limit = SUPPLY_VOLTAGE;
+  driver.init();
+  motor.linkDriver(&driver);
+
+  // Controle por torque (tensão), sem sensor de corrente
+  motor.voltage_limit = VOLTAGE_LIMIT_MAX;
+  motor.controller = MotionControlType::torque;
+  motor.torque_controller = TorqueControlType::voltage;
+
+  motor.useMonitoring(SerialBT);
+
+  motor.init();
+  motor.initFOC();
+
+  command.add('A', onAmp,  "amplitude onda quadrada (V) [modo M0]");
+  command.add('P', onPer,  "periodo onda quadrada (ms) [modo M0]");
+  command.add('M', onModo, "modo: 0=onda quadrada, 1=PID");
+  command.add('K', onKp,   "Kp");
+  command.add('I', onKi,   "Ki");
+  command.add('D', onKd,   "Kd");
+  command.add('S', onSet,  "setpoint (graus)");
+  command.add('R', onInv,  "inverte sentido do torque");
+  command.add('L', onLog,  "pede log por N segundos (L0 para)");
+  command.add('F', onFmt,  "formato do log (F1=CSV, F0=texto)");
+  command.add('T', onTelem,"taxa do log (Hz)");
+  command.add('B', onBias, "calibra bias do giro (haste parada)");
+  command.add('Q', onStatus,"status/parametros atuais");
+  command.add('H', onHelp, "legenda do log e comandos");
+  command.add('Z', onZero, "setpoint = angulo atual");
+  command.add('V', onVolt, "limite de tensao (V, max 8)");
+  command.add('J', onImax, "limite do integrador (V)");
+  command.add('X', onKick, "kick de partida (V, X0 desliga)");
+
+  t_ultima_troca = millis();
+}
+
+void loop() {
+  motor.loopFOC();
+
+  // taxa real do loop (diagnóstico)
+  static uint32_t loops = 0, t_loop = 0;
+  loops++;
+  if (millis() - t_loop >= 1000) {
+    loop_hz = loops * 1000.0f / (millis() - t_loop);
+    loops = 0; t_loop = millis();
+  }
+
+  MpuSample s = mpuRead();
+  if (s.ok) updateAngle(s); else mpu_falhas++;
+
+  float out_V = 0;
+
+  if (modo < 0.5f) {
+    // ---- Modo M0: teste em malha aberta (onda quadrada) ----
+    if (millis() - t_ultima_troca > (unsigned long)periodo_ms) {
+      sentido *= -1;
+      t_ultima_troca = millis();
+    }
+    out_V = sentido * constrain(amplitude_V, 0, VOLTAGE_LIMIT_MAX);
+    dbg_err_deg = 0; dbg_P = dbg_I = dbg_D = dbg_pre = 0; dbg_sat = false; dbg_fallen = false;
+  } else {
+    // ---- Modo M1: balanceamento por PID ----
+    float gyro_rate_rads = GYRO_SIGN * s.gz * DEG_TO_RAD;
+    out_V = computePID(angle_est, gyro_rate_rads);
+
+    // ---- Kick de partida (comando X): recua a roda, depois inverte para o pico de torque ----
+    if (kick_V > 0.01f && !bias_cal) {
+      static uint8_t kst = 0;                 // 0 = normal, 1 = recuo, 2 = pulso
+      static uint32_t kt0 = 0, tstuck = 0;
+      static float ksign = 1;                 // sentido da SUBIDA (mesmo sinal da saída do PID)
+      uint32_t tn = millis();
+      if (kst == 0) {
+        bool travado = !dbg_fallen && fabsf(dbg_err_deg) > KICK_ERR_DEG && fabsf(s.gz) < KICK_GZ_DPS;
+        if (!travado) tstuck = 0;
+        else if (tstuck == 0) tstuck = tn;
+        else if (tn - tstuck > KICK_WAIT_MS && tn - kt0 > KICK_COOLDOWN_MS) {
+          ksign = ((dbg_err_deg > 0) ? 1.0f : -1.0f) * dir_motor;
+          kst = 1; kt0 = tn; tstuck = 0;
+          SerialBT.println("KICK");
+        }
+      }
+      if (kst == 1) {
+        out_V = -ksign * kick_V;
+        if (tn - kt0 > KICK_T1_MS) { kst = 2; kt0 = tn; }
+      } else if (kst == 2) {
+        out_V = ksign * kick_V;
+        if (tn - kt0 > KICK_T2_MS) { kst = 0; kt0 = tn; resetPID(); }
+      }
+    }
+  }
+
+  // Calibração do offset do giroscópio (comando B): motor desligado, haste parada
+  if (bias_cal) {
+    out_V = 0;
+    if (s.ok) { bias_soma += s.gz + gyro_bias_z; bias_cnt++; }
+    if ((int32_t)(millis() - bias_fim_ms) >= 0) {
+      bias_cal = false;
+      if (bias_cnt > 50) gyro_bias_z = (float)(bias_soma / bias_cnt);
+      SerialBT.printf("bias gz = %.3f dps (%lu amostras)\n", gyro_bias_z, (unsigned long)bias_cnt);
+      resetPID();
+    }
+  }
+
+  motor.move(out_V);
+
+  // Telemetria via Bluetooth (CSV), limitada a TELEM_HZ e SEM bloquear o controle:
+  // uma única escrita por linha, e se o buffer BT estiver cheio a linha é descartada.
+  static uint32_t t_telem = 0;
+  uint32_t now_ms = millis();
+  if (log_ativo && (int32_t)(now_ms - log_ate_ms) >= 0) {
+    log_ativo = false;
+    SerialBT.println("fim do log");
+  }
+  if (log_ativo && now_ms - t_telem >= (uint32_t)(1000.0f / telem_hz)) {
+    t_telem = now_ms;
+    // (availableForWrite() retorna 0 no BluetoothSerial, por isso não é usado aqui)
+    if (SerialBT.hasClient()) {
+      float ang_deg = angle_est * RAD_TO_DEG;
+      float ang_acc = ANGLE_SIGN * atan2f(s.ax, s.ay) * RAD_TO_DEG;
+      int   clip    = (fabsf(s.ax) > 1.99f || fabsf(s.ay) > 1.99f || fabsf(s.az) > 1.99f) ? 1 : 0;
+      int   m       = (modo < 0.5f) ? 0 : 1;
+      char buf[320];
+      int n;
+      if (fmt_csv) {
+        // colunas: ver comando H (e o cabeçalho enviado no início do log)
+        n = snprintf(buf, sizeof(buf),
+                     "%lu,%d,%.2f,%.2f,%.1f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.2f,%.3f,%.3f,%.3f,%d,%.0f,%lu\n",
+                     (unsigned long)now_ms, m, ang_deg, ang_acc, s.gz, dbg_err_deg,
+                     dbg_P, dbg_I, dbg_D, dbg_pre, out_V, (int)dbg_sat, (int)dbg_fallen,
+                     motor.shaft_velocity, s.ax, s.ay, s.az, clip, loop_hz, (unsigned long)mpu_falhas);
+      } else {
+        n = snprintf(buf, sizeof(buf),
+                     "t=%.2fs M%d | ang=%+.2f acc=%+.2f gz=%+.1f erro=%+.2f | P=%+.3f I=%+.3f D=%+.3f pid=%+.3f OUT=%+.3fV SAT=%d CAIDO=%d | roda=%+.2f rad/s | a=(%+.2f,%+.2f,%+.2f)g CLIP=%d | loop=%.0fHz falhas=%lu\n",
+                     now_ms / 1000.0f, m, ang_deg, ang_acc, s.gz, dbg_err_deg,
+                     dbg_P, dbg_I, dbg_D, dbg_pre, out_V, (int)dbg_sat, (int)dbg_fallen,
+                     motor.shaft_velocity, s.ax, s.ay, s.az, clip, loop_hz, (unsigned long)mpu_falhas);
+      }
+      if (n > (int)sizeof(buf) - 1) n = sizeof(buf) - 1;
+      SerialBT.write((const uint8_t*)buf, n);
+    }
+  }
+
+  command.run();
+}

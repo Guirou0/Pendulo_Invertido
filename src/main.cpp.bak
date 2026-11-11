@@ -1,0 +1,110 @@
+/*
+  Teste de pêndulo invertido com roda de reação
+  Motor: Gimbal 2804 (12N14P -> 7 pares de polos)
+  Encoder: AS5600 (I2C), montado no EIXO DO MOTOR/RODA
+  Driver: SimpleFOCmini (DRV8313, 3PWM)
+  Placa: ESP32 Doit DevKit V1
+  Build: PlatformIO (env esp32doit-devkit-v1 em platformio.ini)
+
+  OBJETIVO DO TESTE
+  ------------------
+  O AS5600 está no motor, não no pivô da haste. Este código NÃO mede o
+  ângulo do pêndulo — ele só aplica um torque alternado (onda quadrada)
+  na roda para você observar se a haste balança (movimento de pêndulo)
+  e registra tensão/velocidade/ângulo do MOTOR no Serial para conferência.
+
+  Para estimar o grau de recuperação da HASTE, grave um vídeo (de preferência
+  em câmera lenta) com um transferidor/fundo quadriculado atrás do pêndulo
+  e leia o ângulo máximo antes dele cair, repetindo para cada amplitude testada.
+
+  AJUSTE OS PINOS conforme o seu shield/placa antes de gravar (env do
+  platformio.ini escolhido muda a placa, não os pinos).
+*/
+
+#include <Arduino.h>
+#include <SimpleFOC.h>
+
+// ---------- Pinos (ESP32 Doit DevKit V1) ----------
+// SimpleFOCmini: 3 PWM (A,B,C) + Enable
+// Pinos escolhidos evitam strapping pins (0,2,12,15), flash SPI (6-11)
+// e pinos só-entrada (34-39). I2C do AS5600 usa os padrões do ESP32
+// (SDA=21, SCL=22), que não conflitam com os pinos abaixo.
+#define PIN_PWM_A   25
+#define PIN_PWM_B   26
+#define PIN_PWM_C   27
+#define PIN_ENABLE  33
+
+// Alimentação
+#define SUPPLY_VOLTAGE 14.78   // tensão da fonte do driver (dentro de 7.4-16V do motor)
+
+// ---------- Hardware ----------
+BLDCMotor motor = BLDCMotor(7);                     // 2804 12N14P -> 7 pares de polos
+BLDCDriver3PWM driver = BLDCDriver3PWM(PIN_PWM_A, PIN_PWM_B, PIN_PWM_C, PIN_ENABLE);
+MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
+
+// ---------- Parâmetros do teste (comece baixo e vá subindo) ----------
+float amplitude_V    = 4.0;   // tensão aplicada (V) -> aumente aos poucos
+float periodo_ms     = 700;   // tempo em cada sentido antes de inverter (ms)
+const float VOLTAGE_LIMIT_MAX = 4.0; // trava de segurança (não passe disso sem revisar o motor)
+
+unsigned long t_ultima_troca = 0;
+int sentido = 1;
+float alvo_V = 0;
+
+Commander command = Commander(Serial);
+void onAmp(char* cmd)  { command.scalar(&amplitude_V, cmd); }
+void onPer(char* cmd)  { command.scalar(&periodo_ms, cmd); }
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Encoder AS5600
+  Wire.begin();
+  sensor.init();
+  motor.linkSensor(&sensor);
+
+  // Driver
+  driver.voltage_power_supply = SUPPLY_VOLTAGE;     // tensão da fonte do driver (dentro de 7.4-16V do motor)
+  driver.voltage_limit = SUPPLY_VOLTAGE;
+  driver.init();
+  motor.linkDriver(&driver);
+
+  // Controle por torque (tensão), sem sensor de corrente
+  motor.voltage_limit = min(amplitude_V + 0.5f, VOLTAGE_LIMIT_MAX);
+  motor.controller = MotionControlType::torque;
+  motor.torque_controller = TorqueControlType::voltage;
+
+  // Opcional: ver estados internos no monitor serial
+  motor.useMonitoring(Serial);
+
+  motor.init();
+  motor.initFOC();   // alinhamento do encoder com o motor
+
+  command.add('A', onAmp, "amplitude (V)");
+  command.add('P', onPer, "periodo (ms)");
+
+  Serial.println("t_ms,alvo_V,angulo_motor_rad,vel_motor_rad_s");
+  t_ultima_troca = millis();
+}
+
+void loop() {
+  motor.loopFOC();
+
+  // Onda quadrada: inverte o sentido a cada 'periodo_ms'
+  if (millis() - t_ultima_troca > (unsigned long)periodo_ms) {
+    sentido *= -1;
+    t_ultima_troca = millis();
+  }
+  alvo_V = sentido * constrain(amplitude_V, 0, VOLTAGE_LIMIT_MAX);
+
+  motor.move(alvo_V);
+
+  // Log para o Serial Plotter / planilha
+  Serial.print(millis());             Serial.print(",");
+  Serial.print(alvo_V, 3);            Serial.print(",");
+  Serial.print(motor.shaft_angle, 4); Serial.print(",");
+  Serial.println(motor.shaft_velocity, 4);
+
+  command.run();   // permite digitar "A1.5" ou "P800" no Serial Monitor para ajustar ao vivo
+}
