@@ -33,7 +33,7 @@
   M2 = PID + pulsos (amplitude do pulso vinda do PID, mínimo C, máximo V)
   M3 = balanceamento por LQI (realimentação de estados + integrador na velocidade da roda):
          u = -(k1*theta + k2*dtheta + k3*w_roda + k4*z),  z = integral de (0 - w_roda)
-       Ganhos calculados no lqi_ganhos.py (modelo do Fusion). Ajuste fino: $1..$5. Sem kick.
+       Ganhos calculados no lqi_ganhos.py (modelo do Fusion). Ajuste fino: $1..$5. Usa o kick (X) quando trava.
 
   COMANDOS BLUETOOTH (digite no app de terminal serial BT, Enter após):
     !         DESLIGA o motor (vai para STANDBY).  !1 = desliga e entra em ECONOMIA já.
@@ -59,7 +59,7 @@
     H         legenda de cada coluna do log + lista de comandos
     J<volts>  limite do termo integral (padrão 1, máx. 4)
     C<volts>  M2: amplitude mínima do pulso | N<graus> zona morta | O<ms> tempo mínimo entre reversões
-    X<volts>  kick de partida (vale em M1 e M2; padrão 2 V; X0 desliga)
+    X<volts>  kick de partida (vale em M1, M2 e M3; padrão 2 V; X0 desliga)
     G<ms>     kick: tempo parado antes de disparar (padrão 120) | U<dps> |gz| que conta como parado (15) | E<ms> recuo (120)
     #<volts>  tensão de alimentação real (6 a 16 V), ex.: #12.4 — meça com multímetro; W salva
     W         SALVA os parâmetros na memória (carregados a cada boot) | Y apaga o que foi salvo
@@ -360,13 +360,13 @@ float bb_db_deg = 0.8f;     // zona morta (graus)                           coma
 float bb_dwell_ms = 60.0f;  // tempo mínimo entre reversões (ms)            comando O
 
 // ---- Modo M3: LQI ----
-// Ganhos calculados com o modelo físico do Fusion (New_Pendulo): massa 185,2 g | CM a 94,4 mm do pivô |
-// I_pivô 2.064.919 g·mm² | I_roda 343.000 g·mm² | motor 2804 220 KV, 2,3 ohm de fase.
+// Ganhos calculados (lqi_ganhos.py) com o CAD novo (FreeCAD, 23/11/2026): massa 279,17 g | CM a 118,85 mm do pivô |
+// I_pivô ≈ 4.930.000 g·mm² e I_roda ≈ 343.000 g·mm² (ESTIMADOS: troque pelos valores do CAD) | motor 2804 220 KV, 2,3 ohm de fase.
 // Limites (Bryson): ângulo 2°, haste 1 rad/s, roda 60 rad/s, integral 20 rad, tensão 4 V.
 // Recalcule com lqi_ganhos.py se o pêndulo mudar fisicamente. Na bancada, ajuste pelo comando $.
-float lqi_k1 = 134.03f;   // V/rad        ângulo da haste (≈ 2,34 V/grau)
-float lqi_k2 = 8.324f;    // V/(rad/s)    velocidade da haste (giroscópio)
-float lqi_k3 = -0.3694f;  // V/(rad/s)    velocidade da roda (encoder) — negativo é normal
+float lqi_k1 = 154.69f;   // V/rad        ângulo da haste (≈ 2,70 V/grau)
+float lqi_k2 = 13.189f;   // V/(rad/s)    velocidade da haste (giroscópio)
+float lqi_k3 = -0.2969f;  // V/(rad/s)    velocidade da roda (encoder) — negativo é normal
 float lqi_k4 = 0.200f;    // V/rad        integral da velocidade da roda
 float lqi_zmax_V = 2.0f;  // limite do termo integral k4*z (anti-windup), em V
 float lqi_z = 0;          // estado do integrador: z = integral de (0 - w_roda), em rad
@@ -627,10 +627,11 @@ void ctrlStep() {
       out_V = computePID(angle_est, gyro_rate_rads);
     }
 
-    // ---- Kick de partida (comando X), vale para M1 E M2 (no M3 o LQI já controla a velocidade da roda) ----
+    // ---- Kick de partida (comando X), vale para M1, M2 e M3 ----
+    // No M3 o recuo também ajuda a descarregar a roda saturada (o termo -k3*w fica grande e prende a saída no limite).
     // Se a haste fica parada longe do setpoint (ex.: encostada no limite), a roda já está na velocidade
     // máxima da tensão e não gera mais torque. O kick recua a roda e depois inverte para o lado da subida.
-    if (md >= 0.5f && md < 2.5f && kick_V > 0.01f) {
+    if (md >= 0.5f && kick_V > 0.01f) {
       if (kst == 0) {
         bool travado = !dbg_fallen && fabsf(dbg_err_deg) > KICK_ERR_DEG && fabsf(s.gz) < kick_gz_dps;
         if (!travado) tstuck = 0;
@@ -969,7 +970,7 @@ void onStatus(char* cmd) {
   SerialBT.printf("controle=%.0f Hz (nucleo 0)  FOC=%.0f Hz (nucleo 1)  mpu_falhas=%lu  bias_gz=%.3f dps  DLPF=%d  CPU=%d MHz\n",
                   ctrl_hz, foc_hz, (unsigned long)mpu_falhas, gyro_bias_z, (int)MPU_DLPF_CFG, (int)getCpuFrequencyMhz());
   onLQI(NULL);
-  SerialBT.printf("kick=%.1f V (0 = desligado, M1 e M2)  C=%.2f V  N=%.2f deg  O=%.0f ms\n", kick_V, bb_V, bb_db_deg, bb_dwell_ms);
+  SerialBT.printf("kick=%.1f V (0 = desligado, M1/M2/M3)  C=%.2f V  N=%.2f deg  O=%.0f ms\n", kick_V, bb_V, bb_db_deg, bb_dwell_ms);
   SerialBT.printf("kick tempos: G(espera)=%.0f ms  U(|gz| parado)=%.0f dps  E(recuo)=%.0f ms\n", kick_wait_ms, kick_gz_dps, kick_t1_ms);
   SerialBT.printf("economia em %.0f s sem comando (^)  auto-desligar longe do setpoint por %.0f s (%%)  janela do auto-ajuste %.0f s\n",
                   eco_s, perda_s, tune_win_s);
@@ -1006,7 +1007,7 @@ void onHelp(char* cmd) {
   SerialBT.println("L<seg> log (L0 para) | F formato | T<hz> taxa | B bias giro | Q status | H ajuda");
   SerialBT.println("M2 = PID + pulsos: C amplitude minima | N zona morta (graus) | O dwell (ms)");
   SerialBT.println("M3 = LQI: $ mostra ganhos | $1 k1 | $2 k2 | $3 k3 | $4 k4 | $5 limite integral (V)");
-  SerialBT.println("kick (M1 e M2): X<V> (X0 desliga) | G espera (ms) | U |gz| parado (dps) | E recuo (ms)");
+  SerialBT.println("kick (M1, M2 e M3): X<V> (X0 desliga) | G espera (ms) | U |gz| parado (dps) | E recuo (ms)");
   SerialBT.println("limites: V<V> tensao max (<=8) | J integrador (V) | #<V> tensao da fonte");
 }
 
@@ -1071,7 +1072,7 @@ void onSupply(char* cmd) {
   SerialBT.printf("tensao de alimentacao = %.2f V\n", supply_V);
 }
 
-// Tempos do kick (valem em M1 e M2). Sem argumento só mostram o valor atual.
+// Tempos do kick (valem em M1, M2 e M3). Sem argumento só mostram o valor atual.
 void onKWait(char* cmd) { cmdScalar(&kick_wait_ms, cmd); kick_wait_ms = constrain(kick_wait_ms, 20.0f, 2000.0f); }
 void onKGz(char* cmd)   { cmdScalar(&kick_gz_dps, cmd);  kick_gz_dps  = constrain(kick_gz_dps, 1.0f, 200.0f); }
 void onKT1(char* cmd)   { cmdScalar(&kick_t1_ms, cmd);   kick_t1_ms   = constrain(kick_t1_ms, 20.0f, 500.0f); }
