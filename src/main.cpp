@@ -1,5 +1,5 @@
 /*
-  Pêndulo invertido com roda de reação — FreeRTOS, modo desligado e auto-ajuste
+  Pêndulo invertido com roda de reação — FreeRTOS, modo desligado, PID/pulsos/LQI e auto-ajuste
   Motor:    Gimbal 2804 (12N14P -> 7 pares de polos)
   Encoder:  AS5600 (I2C bus 0 / Wire), no EIXO DO MOTOR/RODA
   IMU:      GY-521 / MPU6050 (I2C bus 1 / Wire1), fixado na HASTE
@@ -12,7 +12,7 @@
   --------------------------------------------------------------------
   Núcleo 1 | loop()      FOC: motor.loopFOC() + motor.move() o mais rápido possível (lê o AS5600).
                          Só executa com o motor LIGADO; senão dorme.
-  Núcleo 0 | ctrlTask    (prioridade alta, 500 Hz) lê o IMU (Wire1), filtro, PID / M2 / kick,
+  Núcleo 0 | ctrlTask    (prioridade alta, 500 Hz) lê o IMU (Wire1), filtro, PID / M2 / M3 / kick,
                          proteções. Publica a tensão desejada em u_cmd.
   Núcleo 0 | comTask     (prioridade baixa) Bluetooth: comandos, log, economia de energia e
                          auto-ajuste. Se o Bluetooth travar, o controle NÃO é afetado.
@@ -29,19 +29,23 @@
   MODOS (valem no estado ATIVO)
   --------------------------------------------------------------------
   M0 = teste em malha aberta (onda quadrada de tensão)
-  M1 = balanceamento por PID (padrão)
+  M1 = balanceamento por PID (padrão), com kick de partida (X)
   M2 = PID + pulsos (amplitude do pulso vinda do PID, mínimo C, máximo V)
+  M3 = balanceamento por LQI (realimentação de estados + integrador na velocidade da roda):
+         u = -(k1*theta + k2*dtheta + k3*w_roda + k4*z),  z = integral de (0 - w_roda)
+       Ganhos calculados no lqi_ganhos.py (modelo do Fusion). Ajuste fino: $1..$5. Sem kick.
 
   COMANDOS BLUETOOTH (digite no app de terminal serial BT, Enter após):
     !         DESLIGA o motor (vai para STANDBY).  !1 = desliga e entra em ECONOMIA já.
-    @         LIGA o motor no modo atual.          @0 / @1 / @2 = liga já no modo escolhido.
-    $<s>      segundos sem comando até entrar em economia (padrão 120; 0 = nunca)
+    @         LIGA o motor no modo atual.          @0 a @3 = liga já no modo escolhido.
+    ^<s>      segundos sem comando até entrar em economia (padrão 120; 0 = nunca)
+    $         ganhos do LQI (M3): "$" mostra | $1 k1 | $2 k2 | $3 k3 | $4 k4 | $5 limite do termo integral (V)
     %<s>      desliga SOZINHO se ficar longe do setpoint (> 4 graus) por mais de <s> s (padrão 20; 0 = nunca)
-    ~         AUTO-AJUSTE do PID (twiddle) com o motor ligado em M1 ou M2.  ~<s> = janela de <s> s por teste.
+    ~         AUTO-AJUSTE (twiddle) com o motor ligado: M1 = Kp,Kd,Ki | M2 = Kp,Kd,Ki,C | M3 = escalas dos ganhos k1..k4.  ~<s> = janela de <s> s por teste.
               ~0 cancela (mantém os melhores valores achados até ali). Depois use W para salvar.
     A<valor>  amplitude da onda quadrada no modo M0 (V)
     P<valor>  período da onda quadrada no modo M0 (ms)
-    M<0,1,2>  troca de modo
+    M<0,1,2,3> troca de modo
     K<valor>  Kp do PID
     I<valor>  Ki do PID
     D<valor>  Kd do PID
@@ -128,6 +132,7 @@ BluetoothSerial SerialBT;
 // ============================================================
 enum : uint8_t { EST_ECO = 0, EST_STANDBY = 1, EST_ATIVO = 2 };
 volatile uint8_t  estado    = EST_STANDBY;   // começa DESLIGADO (motor sem energia)
+volatile float    wheel_vel = 0;             // velocidade da roda (rad/s), escrita pelo FOC, lida pelo controle
 volatile float    u_cmd     = 0;             // tensão desejada (V): escrita pelo controle, lida pelo FOC
 volatile bool     motor_on  = false;         // true = driver habilitado (só o loop() FOC desliga)
 volatile uint32_t foc_count = 0;             // voltas do loop FOC (para medir a taxa)
@@ -330,7 +335,8 @@ unsigned long t_prev_pid = 0;
 const float SAFETY_ANGLE_DEG = 70.0f;      // acima disso, considera "caído" e desliga a saída
 float I_MAX_V = 1.0f;                      // limite do termo integral (anti-windup), em V — comando J
 float dir_motor = 1.0f;                    // +1 / -1: sentido do torque (comando R inverte)
-float modo = 1.0f;                         // 0 = M0 | 1 = M1 | 2 = M2
+float modo = 1.0f;                         // 0 = M0 | 1 = M1 PID | 2 = M2 PID+pulsos | 3 = M3 LQI
+int modoIdx(float m) { return (m < 0.5f) ? 0 : (m < 1.5f ? 1 : (m < 2.5f ? 2 : 3)); }
 
 // ---- Variáveis de depuração (preenchidas pelo PID, lidas pelo log) ----
 float dbg_err_deg = 0;      // erro = setpoint - ângulo (graus)
@@ -352,6 +358,20 @@ bool     log_ativo  = false;
 float bb_V = 2.0f;          // amplitude mínima do pulso (V)                comando C
 float bb_db_deg = 0.8f;     // zona morta (graus)                           comando N
 float bb_dwell_ms = 60.0f;  // tempo mínimo entre reversões (ms)            comando O
+
+// ---- Modo M3: LQI ----
+// Ganhos calculados com o modelo físico do Fusion (New_Pendulo): massa 185,2 g | CM a 94,4 mm do pivô |
+// I_pivô 2.064.919 g·mm² | I_roda 343.000 g·mm² | motor 2804 220 KV, 2,3 ohm de fase.
+// Limites (Bryson): ângulo 2°, haste 1 rad/s, roda 60 rad/s, integral 20 rad, tensão 4 V.
+// Recalcule com lqi_ganhos.py se o pêndulo mudar fisicamente. Na bancada, ajuste pelo comando $.
+float lqi_k1 = 134.03f;   // V/rad        ângulo da haste (≈ 2,34 V/grau)
+float lqi_k2 = 8.324f;    // V/(rad/s)    velocidade da haste (giroscópio)
+float lqi_k3 = -0.3694f;  // V/(rad/s)    velocidade da roda (encoder) — negativo é normal
+float lqi_k4 = 0.200f;    // V/rad        integral da velocidade da roda
+float lqi_zmax_V = 2.0f;  // limite do termo integral k4*z (anti-windup), em V
+float lqi_z = 0;          // estado do integrador: z = integral de (0 - w_roda), em rad
+unsigned long t_prev_lqi = 0;
+float dbg_W = 0;          // contribuição do termo da roda (-k3*w), em V (log)
 
 // Tensão de alimentação usada pelo driver para converter volts em PWM (comando #).
 float supply_V = SUPPLY_VOLTAGE;
@@ -414,7 +434,7 @@ float tuneCost(const Metrics& m) {
 // ---- Telemetria (cópia atômica do último ciclo de controle) ----
 struct Telem {
   uint32_t t_ms; int modo; float ang, ang_acc, gz, err, P, I, D, pre, out; int sat, fallen;
-  float ax, ay, az; int clip;
+  float ax, ay, az; int clip; float W;
 };
 Telem telem = {};
 portMUX_TYPE telMux = portMUX_INITIALIZER_UNLOCKED;
@@ -426,6 +446,8 @@ void telemGet(Telem* out) { portENTER_CRITICAL(&telMux); *out = telem; portEXIT_
 void resetPID() {
   pid_integral = 0;
   t_prev_pid = 0;
+  lqi_z = 0;          // o LQI também zera junto (troca de modo, R, S, Z, B, fim do kick...)
+  t_prev_lqi = 0;
 }
 
 void ctrlResetStates() {
@@ -439,6 +461,7 @@ float computePID(float angle_rad, float gyro_rate_rads) {
   float dt = (t_prev_pid == 0) ? 0.005f : (now - t_prev_pid) * 1e-6f;
   t_prev_pid = now;
   dt = constrain(dt, 1e-4f, 0.05f);        // protege contra dt zero ou saltos grandes
+  dbg_W = 0;
 
   if (fabsf(angle_rad) * RAD_TO_DEG > SAFETY_ANGLE_DEG) {
     pid_integral = 0;    // pêndulo caído: desliga e não acumula erro
@@ -476,12 +499,64 @@ float computePID(float angle_rad, float gyro_rate_rads) {
   return dir_motor * sat;                  // dir_motor inverte o sentido do torque
 }
 
+// ============================================================
+//  LQI de balanceamento (modo M3) — só a tarefa de controle chama
+// ============================================================
+// Convenção (a mesma do lqi_ganhos.py):
+//   u > 0 acelera a roda no sentido positivo e empurra a haste para +theta.
+//   O motor recebe dir_motor * u, e a velocidade da roda é lida como dir_motor * wheel_vel,
+//   então o comando R inverte as duas coisas juntas e o modelo continua consistente.
+float computeLQI(float angle_rad, float gyro_rate_rads, float wheel_vel_rads) {
+  unsigned long now = micros();
+  float dt = (t_prev_lqi == 0) ? 0.002f : (now - t_prev_lqi) * 1e-6f;
+  t_prev_lqi = now;
+  dt = constrain(dt, 1e-4f, 0.05f);
+
+  float theta  = angle_rad - setpoint_deg * DEG_TO_RAD;   // desvio em relação ao setpoint (rad)
+  float dtheta = gyro_rate_rads;                          // rad/s
+  float w      = dir_motor * wheel_vel_rads;              // rad/s, no sentido de u
+
+  dbg_err_deg = -theta * RAD_TO_DEG;   // mesmo significado do PID: setpoint - ângulo
+
+  if (fabsf(angle_rad) * RAD_TO_DEG > SAFETY_ANGLE_DEG) {   // haste caída: desliga e zera o integrador
+    lqi_z = 0;
+    dbg_fallen = true;
+    dbg_P = dbg_I = dbg_D = dbg_W = dbg_pre = 0;
+    dbg_sat = false;
+    return 0;
+  }
+  dbg_fallen = false;
+
+  // Integrador: z = integral de (referência - saída), referência = roda parada
+  float dz = (0.0f - w) * dt;
+  lqi_z += dz;
+  if (fabsf(lqi_k4) > 1e-6f) {                          // limita o termo integral a ±lqi_zmax_V volts
+    float zlim = lqi_zmax_V / fabsf(lqi_k4);
+    lqi_z = constrain(lqi_z, -zlim, zlim);
+  }
+
+  // Lei de controle u = -K x, termo a termo (para o log)
+  float uP = -lqi_k1 * theta;     // ângulo
+  float uD = -lqi_k2 * dtheta;    // velocidade da haste
+  float uW = -lqi_k3 * w;         // velocidade da roda
+  float uI = -lqi_k4 * lqi_z;     // integral
+  float u  = uP + uD + uW + uI;
+
+  float sat = constrain(u, -VOLTAGE_LIMIT_MAX, VOLTAGE_LIMIT_MAX);
+  if (sat != u && (-lqi_k4 * dz) * u > 0) lqi_z -= dz;   // anti-windup: desfaz se saturou a favor do integrador
+
+  dbg_P = uP; dbg_D = uD; dbg_W = uW; dbg_I = -lqi_k4 * lqi_z;
+  dbg_pre = u;
+  dbg_sat = (sat != u);
+  return dir_motor * sat;
+}
+
 // M0: teste em malha aberta (onda quadrada)
 float amplitude_V = 1.0f;
 float periodo_ms  = 700;
 
 // ============================================================
-//  TAREFA DE CONTROLE (núcleo 0): IMU + filtro + PID/M2/kick + proteções
+//  TAREFA DE CONTROLE (núcleo 0): IMU + filtro + PID/M2/M3/kick + proteções
 // ============================================================
 void ctrlStep() {
   if (mpu_sleep_req) { mpuSleep(); mpu_awake = false; mpu_sleep_req = false; }
@@ -530,7 +605,10 @@ void ctrlStep() {
       // ---- Modo M0: teste em malha aberta (onda quadrada) ----
       if (now - t_ultima_troca > (unsigned long)periodo_ms) { sentido *= -1; t_ultima_troca = now; }
       out_V = sentido * constrain(amplitude_V, 0.0f, VOLTAGE_LIMIT_MAX);
-      dbg_err_deg = 0; dbg_P = dbg_I = dbg_D = dbg_pre = 0; dbg_sat = false; dbg_fallen = false;
+      dbg_err_deg = 0; dbg_P = dbg_I = dbg_D = dbg_W = dbg_pre = 0; dbg_sat = false; dbg_fallen = false;
+    } else if (md > 2.5f) {
+      // ---- Modo M3: LQI (ângulo, velocidade da haste, velocidade da roda, integral da roda) ----
+      out_V = computeLQI(angle_est, gyro_rate_rads, wheel_vel);
     } else if (md > 1.5f) {
       // ---- Modo M2: PID + pulsos (amplitude vinda do PID, com mínimo = kick) ----
       //   sentido   = sinal de u (tempo mínimo O entre reversões -> cada reversão dá o pico de torque)
@@ -549,10 +627,10 @@ void ctrlStep() {
       out_V = computePID(angle_est, gyro_rate_rads);
     }
 
-    // ---- Kick de partida (comando X), vale para M1 E M2 ----
+    // ---- Kick de partida (comando X), vale para M1 E M2 (no M3 o LQI já controla a velocidade da roda) ----
     // Se a haste fica parada longe do setpoint (ex.: encostada no limite), a roda já está na velocidade
     // máxima da tensão e não gera mais torque. O kick recua a roda e depois inverte para o lado da subida.
-    if (md >= 0.5f && kick_V > 0.01f) {
+    if (md >= 0.5f && md < 2.5f && kick_V > 0.01f) {
       if (kst == 0) {
         bool travado = !dbg_fallen && fabsf(dbg_err_deg) > KICK_ERR_DEG && fabsf(s.gz) < kick_gz_dps;
         if (!travado) tstuck = 0;
@@ -591,11 +669,11 @@ void ctrlStep() {
 
   // Publica a telemetria deste ciclo
   Telem t;
-  t.t_ms = now; t.modo = (md < 0.5f) ? 0 : (md > 1.5f ? 2 : 1);
+  t.t_ms = now; t.modo = modoIdx(md);
   t.ang = angle_est * RAD_TO_DEG; t.ang_acc = ANGLE_SIGN * atan2f(s.ax, s.ay) * RAD_TO_DEG; t.gz = s.gz;
   t.err = dbg_err_deg; t.P = dbg_P; t.I = dbg_I; t.D = dbg_D; t.pre = dbg_pre; t.out = out_V;
   t.sat = dbg_sat ? 1 : 0; t.fallen = dbg_fallen ? 1 : 0;
-  t.ax = s.ax; t.ay = s.ay; t.az = s.az;
+  t.ax = s.ax; t.ay = s.ay; t.az = s.az; t.W = dbg_W;
   t.clip = (fabsf(s.ax) > 1.99f || fabsf(s.ay) > 1.99f || fabsf(s.az) > 1.99f) ? 1 : 0;
   portENTER_CRITICAL(&telMux); telem = t; portEXIT_CRITICAL(&telMux);
 }
@@ -669,6 +747,7 @@ void cmdRun() {
 const char* estadoNome(uint8_t e) { return e == EST_ATIVO ? "ATIVO" : (e == EST_STANDBY ? "STANDBY" : "ECONOMIA"); }
 
 void tuneFinish(bool abortado, const char* motivo);   // definida mais abaixo
+void onLQI(char* cmd);                                  // definida mais abaixo
 
 void acordar() {
   if (estado != EST_ECO) return;
@@ -724,7 +803,7 @@ void ligar() {
   }
   motor_on = true;
   estado = EST_ATIVO;
-  SerialBT.printf(">>> LIGADO em M%d. '!' desliga.\n", modo < 0.5f ? 0 : (modo > 1.5f ? 2 : 1));
+  SerialBT.printf(">>> LIGADO em M%d. '!' desliga.\n", modoIdx(modo));
 }
 
 // ============================================================
@@ -738,9 +817,21 @@ float* tune_ptr[Twiddle::MAXP];
 const char* tune_name[Twiddle::MAXP];
 int tune_n = 0;
 float tune_cost0 = 0;
+bool  tune_lqi = false;                 // true = ajusta escalas dos ganhos LQI (M3)
+float tune_scale[4] = {1, 1, 1, 1};
+float tune_base[4]  = {0, 0, 0, 0};
 #define TUNE_WARM_MS 2000
 
-void tuneApply(const float* v) { for (int i = 0; i < tune_n; i++) *tune_ptr[i] = v[i]; }
+void lqiApplyScale() {
+  lqi_k1 = tune_base[0] * tune_scale[0];
+  lqi_k2 = tune_base[1] * tune_scale[1];
+  lqi_k3 = tune_base[2] * tune_scale[2];
+  lqi_k4 = tune_base[3] * tune_scale[3];
+}
+void tuneApply(const float* v) {
+  for (int i = 0; i < tune_n; i++) *tune_ptr[i] = v[i];
+  if (tune_lqi) lqiApplyScale();
+}
 
 void tunePrintParams() {
   for (int i = 0; i < tune_n; i++) SerialBT.printf(" %s=%.3f", tune_name[i], *tune_ptr[i]);
@@ -753,12 +844,13 @@ void tuneFinish(bool abortado, const char* motivo) {
   SerialBT.printf("TUNE %s (%d testes, %s):", abortado ? "INTERROMPIDO" : "FIM", tw.trials, motivo);
   tunePrintParams();
   SerialBT.printf(" custo=%.2f (inicial %.2f). Mande W para salvar.\n", tw.best_cost, tune_cost0);
+  if (tune_lqi) onLQI(NULL);
 }
 
 void tuneStart() {
   if (tune_on) { SerialBT.println("auto-ajuste ja esta rodando (~0 cancela)."); return; }
   if (estado != EST_ATIVO || modo < 0.5f) {
-    SerialBT.println("auto-ajuste precisa do motor LIGADO (@) em M1 ou M2, com o pendulo em equilibrio.");
+    SerialBT.println("auto-ajuste precisa do motor LIGADO (@) em M1, M2 ou M3, com o pendulo em equilibrio.");
     return;
   }
   float init[Twiddle::MAXP], lo[Twiddle::MAXP], hi[Twiddle::MAXP];
@@ -767,10 +859,22 @@ void tuneStart() {
   #define TUNE_ADD(PTR, NAME, ABS_LO, ABS_HI) \
     { float v0 = *(PTR); tune_ptr[n] = (PTR); tune_name[n] = (NAME); init[n] = v0; \
       lo[n] = max((float)(ABS_LO), v0 * 0.25f); hi[n] = min((float)(ABS_HI), v0 * 4.0f); n++; }
-  TUNE_ADD(&Kp, "Kp", 1.0f, 100.0f);
-  TUNE_ADD(&Kd, "Kd", 0.02f, 10.0f);
-  if (Ki > 0.05f) TUNE_ADD(&Ki, "Ki", 0.05f, 20.0f);
-  if (modo > 1.5f) TUNE_ADD(&bb_V, "C", 0.3f, VOLTAGE_LIMIT_MAX);
+  tune_lqi = (modo > 2.5f);
+  if (tune_lqi) {
+    // LQI: ajusta ESCALAS multiplicativas (ganho = base * escala), de 0,4x a 2,5x; assim o sinal do k3 é preservado
+    tune_base[0] = lqi_k1; tune_base[1] = lqi_k2; tune_base[2] = lqi_k3; tune_base[3] = lqi_k4;
+    const char* nm[4] = {"k1x", "k2x", "k3x", "k4x"};
+    for (int i = 0; i < 4; i++) {
+      if (fabsf(tune_base[i]) < 1e-6f) continue;     // ganho zerado: não ajusta
+      tune_scale[i] = 1.0f;
+      tune_ptr[n] = &tune_scale[i]; tune_name[n] = nm[i]; init[n] = 1.0f; lo[n] = 0.4f; hi[n] = 2.5f; n++;
+    }
+  } else {
+    TUNE_ADD(&Kp, "Kp", 1.0f, 100.0f);
+    TUNE_ADD(&Kd, "Kd", 0.02f, 10.0f);
+    if (Ki > 0.05f) TUNE_ADD(&Ki, "Ki", 0.05f, 20.0f);
+    if (modo > 1.5f) TUNE_ADD(&bb_V, "C", 0.3f, VOLTAGE_LIMIT_MAX);
+  }
   #undef TUNE_ADD
   tune_n = n;
   tw.begin(n, init, lo, hi, 0.25f);
@@ -785,7 +889,7 @@ void tuneStart() {
 
 void tuneStep() {
   if (!tune_on) return;
-  if (estado != EST_ATIVO || modo < 0.5f) { tuneFinish(true, "motor desligado ou M0"); return; }
+  if (estado != EST_ATIVO || modo < 0.5f || (modo > 2.5f) != tune_lqi) { tuneFinish(true, "motor desligado ou modo trocado"); return; }
   uint32_t now = millis();
   if (tune_st == T_WARM) {
     if (now - tune_t0 >= TUNE_WARM_MS) { Metrics d; metricsTake(&d); tune_t0 = now; tune_st = T_MEAS; }
@@ -817,7 +921,7 @@ void tuneStep() {
 // ============================================================
 void onAmp(char* cmd)  { cmdScalar(&amplitude_V, cmd); }
 void onPer(char* cmd)  { cmdScalar(&periodo_ms, cmd); }
-void onModo(char* cmd) { cmdScalar(&modo, cmd); modo = constrain(modo, 0.0f, 2.0f); ctrlReset(); }
+void onModo(char* cmd) { cmdScalar(&modo, cmd); modo = constrain(modo, 0.0f, 3.0f); ctrlReset(); }
 
 // R: inverte o sentido do torque do motor (use se ele reagir para o lado errado)
 void onInv(char* cmd) {
@@ -828,7 +932,7 @@ void onInv(char* cmd) {
 }
 
 void printHeader() {
-  SerialBT.println("t_ms,modo,ang_deg,ang_acc_deg,gz_dps,erro_deg,P_V,I_V,D_V,pid_V,saida_V,sat,caido,vel_roda_rads,ax_g,ay_g,az_g,clip,ctrl_hz,foc_hz,mpu_falhas");
+  SerialBT.println("t_ms,modo,ang_deg,ang_acc_deg,gz_dps,erro_deg,P_V,I_V,D_V,pid_V,saida_V,sat,caido,vel_roda_rads,ax_g,ay_g,az_g,clip,ctrl_hz,foc_hz,mpu_falhas,W_V");
 }
 
 // F: troca o formato do log. F1 = CSV (para planilha/gráfico), F0 = texto legível. "F" alterna.
@@ -856,7 +960,7 @@ bool paramsSalvos();   // definida mais abaixo (usa a memória NVS)
 // Q: mostra todos os parâmetros atuais
 void onStatus(char* cmd) {
   SerialBT.printf("estado=%s  modo=M%d  sentido_motor=%+d  setpoint=%.2f deg\n", estadoNome(estado),
-                  modo < 0.5f ? 0 : (modo > 1.5f ? 2 : 1), (int)dir_motor, setpoint_deg);
+                  modoIdx(modo), (int)dir_motor, setpoint_deg);
   SerialBT.printf("Kp=%.3f (= %.3f V por grau)  Ki=%.3f  Kd=%.3f\n", Kp, Kp * DEG_TO_RAD, Ki, Kd);
   SerialBT.printf("limite_saida=%.1f V  I_MAX=%.1f V  corte_queda=%.0f deg  fonte=%.2f V\n",
                   VOLTAGE_LIMIT_MAX, I_MAX_V, SAFETY_ANGLE_DEG, supply_V);
@@ -864,9 +968,10 @@ void onStatus(char* cmd) {
   SerialBT.printf("log: %s a %.0f Hz, %s\n", fmt_csv ? "CSV" : "texto", telem_hz, log_ativo ? "ATIVO" : "parado");
   SerialBT.printf("controle=%.0f Hz (nucleo 0)  FOC=%.0f Hz (nucleo 1)  mpu_falhas=%lu  bias_gz=%.3f dps  DLPF=%d  CPU=%d MHz\n",
                   ctrl_hz, foc_hz, (unsigned long)mpu_falhas, gyro_bias_z, (int)MPU_DLPF_CFG, (int)getCpuFrequencyMhz());
-  SerialBT.printf("kick=%.1f V (0 = desligado)  C=%.2f V  N=%.2f deg  O=%.0f ms\n", kick_V, bb_V, bb_db_deg, bb_dwell_ms);
+  onLQI(NULL);
+  SerialBT.printf("kick=%.1f V (0 = desligado, M1 e M2)  C=%.2f V  N=%.2f deg  O=%.0f ms\n", kick_V, bb_V, bb_db_deg, bb_dwell_ms);
   SerialBT.printf("kick tempos: G(espera)=%.0f ms  U(|gz| parado)=%.0f dps  E(recuo)=%.0f ms\n", kick_wait_ms, kick_gz_dps, kick_t1_ms);
-  SerialBT.printf("economia em %.0f s sem comando ($)  auto-desligar longe do setpoint por %.0f s (%%)  janela do auto-ajuste %.0f s\n",
+  SerialBT.printf("economia em %.0f s sem comando (^)  auto-desligar longe do setpoint por %.0f s (%%)  janela do auto-ajuste %.0f s\n",
                   eco_s, perda_s, tune_win_s);
   SerialBT.printf("memoria: %s\n", paramsSalvos() ? "ha parametros salvos (carregados no boot)" : "nada salvo (valores padrao do codigo)");
   SerialBT.printf("ultimo reset: %s\n", reset_motivo);
@@ -876,12 +981,13 @@ void onStatus(char* cmd) {
 void onHelp(char* cmd) {
   SerialBT.println("--- COLUNAS DO LOG (CSV) ---");
   SerialBT.println("t_ms        tempo desde o boot (ms)");
-  SerialBT.println("modo        0 = onda quadrada, 1 = PID, 2 = PID + pulsos");
+  SerialBT.println("modo        0 = onda quadrada, 1 = PID, 2 = PID + pulsos, 3 = LQI");
   SerialBT.println("ang_deg     angulo da haste filtrado (graus, 0 = vertical) <- o que o PID usa");
   SerialBT.println("ang_acc_deg angulo so do acelerometro (graus), compare com ang_deg");
   SerialBT.println("gz_dps      velocidade angular da haste (graus/s), bias ja removido");
   SerialBT.println("erro_deg    setpoint - ang_deg (graus)");
   SerialBT.println("P_V I_V D_V contribuicao de cada termo do PID (V)");
+  SerialBT.println("            em M3 (LQI): P = -k1*theta, D = -k2*dtheta, I = -k4*z");
   SerialBT.println("pid_V       P+I+D antes de limitar (V)");
   SerialBT.println("saida_V     tensao enviada ao motor (V, ja com limite e sentido R)");
   SerialBT.println("sat         1 = pid_V foi cortado pelo limite de tensao");
@@ -892,13 +998,15 @@ void onHelp(char* cmd) {
   SerialBT.println("ctrl_hz     voltas da tarefa de controle por segundo (ideal ~500)");
   SerialBT.println("foc_hz      voltas do loop FOC por segundo (ideal > 2000)");
   SerialBT.println("mpu_falhas  leituras do MPU que falharam");
+  SerialBT.println("W_V         (ultima coluna) em M3: -k3*w_roda (V)");
   SerialBT.println("--- COMANDOS ---");
-  SerialBT.println("! desliga motor (!1 = ja em economia) | @ liga (@0 @1 @2 escolhe modo) | $<s> tempo p/ economia | %<s> auto-desligar");
+  SerialBT.println("! desliga motor (!1 = ja em economia) | @ liga (@0..@3 escolhe modo) | ^<s> tempo p/ economia | %<s> auto-desligar");
   SerialBT.println("~ auto-ajuste do PID (~<s> janela, ~0 cancela) | W salva | Y apaga salvos");
-  SerialBT.println("M0/M1/M2 modo | K I D ganhos | S setpoint | Z setpoint=angulo atual | R inverte motor");
+  SerialBT.println("M0/M1/M2/M3 modo | K I D ganhos | S setpoint | Z setpoint=angulo atual | R inverte motor");
   SerialBT.println("L<seg> log (L0 para) | F formato | T<hz> taxa | B bias giro | Q status | H ajuda");
   SerialBT.println("M2 = PID + pulsos: C amplitude minima | N zona morta (graus) | O dwell (ms)");
-  SerialBT.println("kick: X<V> (X0 desliga) | G espera (ms) | U |gz| parado (dps) | E recuo (ms)");
+  SerialBT.println("M3 = LQI: $ mostra ganhos | $1 k1 | $2 k2 | $3 k3 | $4 k4 | $5 limite integral (V)");
+  SerialBT.println("kick (M1 e M2): X<V> (X0 desliga) | G espera (ms) | U |gz| parado (dps) | E recuo (ms)");
   SerialBT.println("limites: V<V> tensao max (<=8) | J integrador (V) | #<V> tensao da fonte");
 }
 
@@ -933,6 +1041,25 @@ void onVolt(char* cmd) {
 void onBBV(char* cmd)    { cmdScalar(&bb_V, cmd);        bb_V = constrain(bb_V, 0.0f, 8.0f); }
 void onBBDb(char* cmd)   { cmdScalar(&bb_db_deg, cmd);   bb_db_deg = constrain(bb_db_deg, 0.0f, 10.0f); }
 void onBBDwell(char* cmd){ cmdScalar(&bb_dwell_ms, cmd); bb_dwell_ms = constrain(bb_dwell_ms, 5.0f, 1000.0f); }
+
+// $: ganhos do LQI (M3). "$" mostra todos | "$1 170" muda k1 | $2 k2 | $3 k3 | $4 k4 | $5 limite integral (V)
+void onLQI(char* cmd) {
+  int idx = 0; float val = 0;
+  int n = (cmd != NULL) ? sscanf(cmd, "%d %f", &idx, &val) : 0;
+  if (n == 2) {
+    switch (idx) {
+      case 1: lqi_k1 = val; break;
+      case 2: lqi_k2 = val; break;
+      case 3: lqi_k3 = val; break;
+      case 4: lqi_k4 = val; break;
+      case 5: lqi_zmax_V = constrain(val, 0.0f, 8.0f); break;
+      default: SerialBT.println("use $1..$5"); return;
+    }
+    ctrlReset();   // zera o integrador ao mudar ganho
+  }
+  SerialBT.printf("LQI: k1=%.3f V/rad (%.3f V/grau)  k2=%.3f  k3=%.4f  k4=%.4f  lim_int=%.2f V\n",
+                  lqi_k1, lqi_k1 * DEG_TO_RAD, lqi_k2, lqi_k3, lqi_k4, lqi_zmax_V);
+}
 
 // #<volts>: tensão de alimentação (6 a 16 V). Ex.: "#12.4". Sem argumento só mostra. W salva.
 void onSupply(char* cmd) {
@@ -975,9 +1102,9 @@ void onDesliga(char* cmd) {
   desligar(cmd != NULL && cmd[0] == '1');
 }
 
-// @  liga o motor.  @0 / @1 / @2 = liga já no modo escolhido.
+// @  liga o motor.  @0 a @3 = liga já no modo escolhido.
 void onLiga(char* cmd) {
-  if (cmd != NULL && cmd[0] >= '0' && cmd[0] <= '2') { modo = (float)(cmd[0] - '0'); ctrlReset(); }
+  if (cmd != NULL && cmd[0] >= '0' && cmd[0] <= '3') { modo = (float)(cmd[0] - '0'); ctrlReset(); }
   ligar();
 }
 
@@ -1018,6 +1145,11 @@ void loadParams() {
     bb_V = constrain(prefs.getFloat("c", bb_V), 0.0f, 8.0f);
     bb_db_deg = constrain(prefs.getFloat("n", bb_db_deg), 0.0f, 10.0f);
     bb_dwell_ms = constrain(prefs.getFloat("o", bb_dwell_ms), 5.0f, 1000.0f);
+    lqi_k1 = prefs.getFloat("l1", lqi_k1);
+    lqi_k2 = prefs.getFloat("l2", lqi_k2);
+    lqi_k3 = prefs.getFloat("l3", lqi_k3);
+    lqi_k4 = prefs.getFloat("l4", lqi_k4);
+    lqi_zmax_V = constrain(prefs.getFloat("l5", lqi_zmax_V), 0.0f, 8.0f);
     gyro_bias_z = prefs.getFloat("bias", gyro_bias_z);
     telem_hz = constrain(prefs.getFloat("thz", telem_hz), 1.0f, 50.0f);
     fmt_csv = prefs.getBool("csv", fmt_csv);
@@ -1050,6 +1182,11 @@ void onSave(char* cmd) {
   prefs.putFloat("c", bb_V);
   prefs.putFloat("n", bb_db_deg);
   prefs.putFloat("o", bb_dwell_ms);
+  prefs.putFloat("l1", lqi_k1);
+  prefs.putFloat("l2", lqi_k2);
+  prefs.putFloat("l3", lqi_k3);
+  prefs.putFloat("l4", lqi_k4);
+  prefs.putFloat("l5", lqi_zmax_V);
   prefs.putFloat("bias", gyro_bias_z);
   prefs.putFloat("thz", telem_hz);
   prefs.putBool("csv", fmt_csv);
@@ -1057,7 +1194,7 @@ void onSave(char* cmd) {
   prefs.putFloat("perda", perda_s);
   prefs.putFloat("twin", tune_win_s);
   prefs.end();
-  SerialBT.println("parametros SALVOS na memoria (K I D S R V J X C N O G U E bias T F # $ % ~). Serao carregados no boot.");
+  SerialBT.println("parametros SALVOS na memoria (K I D S R V J X C N O G U E bias T F # ^ % ~ + LQI $1..$5). Serao carregados no boot.");
 }
 
 void onClearSaved(char* cmd) {
@@ -1123,21 +1260,21 @@ void comStep() {
     t_telem = now;
     if (SerialBT.hasClient()) {                    // (availableForWrite() retorna 0 no BluetoothSerial)
       Telem t; telemGet(&t);
-      float vel = motor_on ? motor.shaft_velocity : 0.0f;
+      float vel = wheel_vel;
       char buf[360];
       int n;
       if (fmt_csv) {
         n = snprintf(buf, sizeof(buf),
-                     "%lu,%d,%.2f,%.2f,%.1f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.2f,%.3f,%.3f,%.3f,%d,%.0f,%.0f,%lu\n",
+                     "%lu,%d,%.2f,%.2f,%.1f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.2f,%.3f,%.3f,%.3f,%d,%.0f,%.0f,%lu,%.3f\n",
                      (unsigned long)t.t_ms, t.modo, t.ang, t.ang_acc, t.gz, t.err,
                      t.P, t.I, t.D, t.pre, t.out, t.sat, t.fallen,
-                     vel, t.ax, t.ay, t.az, t.clip, (float)ctrl_hz, (float)foc_hz, (unsigned long)mpu_falhas);
+                     vel, t.ax, t.ay, t.az, t.clip, (float)ctrl_hz, (float)foc_hz, (unsigned long)mpu_falhas, t.W);
       } else {
         n = snprintf(buf, sizeof(buf),
-                     "t=%.2fs M%d | ang=%+.2f acc=%+.2f gz=%+.1f erro=%+.2f | P=%+.3f I=%+.3f D=%+.3f pid=%+.3f OUT=%+.3fV SAT=%d CAIDO=%d | roda=%+.2f rad/s | a=(%+.2f,%+.2f,%+.2f)g CLIP=%d | ctrl=%.0fHz foc=%.0fHz falhas=%lu\n",
+                     "t=%.2fs M%d | ang=%+.2f acc=%+.2f gz=%+.1f erro=%+.2f | P=%+.3f I=%+.3f D=%+.3f pid=%+.3f OUT=%+.3fV SAT=%d CAIDO=%d | roda=%+.2f rad/s | a=(%+.2f,%+.2f,%+.2f)g CLIP=%d | ctrl=%.0fHz foc=%.0fHz falhas=%lu W=%+.3f\n",
                      t.t_ms / 1000.0f, t.modo, t.ang, t.ang_acc, t.gz, t.err,
                      t.P, t.I, t.D, t.pre, t.out, t.sat, t.fallen,
-                     vel, t.ax, t.ay, t.az, t.clip, (float)ctrl_hz, (float)foc_hz, (unsigned long)mpu_falhas);
+                     vel, t.ax, t.ay, t.az, t.clip, (float)ctrl_hz, (float)foc_hz, (unsigned long)mpu_falhas, t.W);
       }
       if (n > (int)sizeof(buf) - 1) n = sizeof(buf) - 1;
       SerialBT.write((const uint8_t*)buf, n);
@@ -1198,12 +1335,13 @@ void setup() {
 
   cmdAdd('!', onDesliga, "desliga o motor (!1 = economia)");
   cmdAdd('@', onLiga,  "liga o motor (@0/@1/@2 = modo)");
-  cmdAdd('$', onEco,   "segundos ate a economia");
+  cmdAdd('^', onEco,   "segundos ate a economia");
+  cmdAdd('$', onLQI,   "ganhos do LQI (M3)");
   cmdAdd('%', onPerda, "auto-desligar longe do setpoint (s)");
   cmdAdd('~', onTune,  "auto-ajuste do PID");
   cmdAdd('A', onAmp,  "amplitude onda quadrada (V) [modo M0]");
   cmdAdd('P', onPer,  "periodo onda quadrada (ms) [modo M0]");
-  cmdAdd('M', onModo, "modo: 0=onda quadrada, 1=PID, 2=PID+pulsos");
+  cmdAdd('M', onModo, "modo: 0=onda quadrada, 1=PID, 2=PID+pulsos, 3=LQI");
   cmdAdd('K', onKp,   "Kp");
   cmdAdd('I', onKi,   "Ki");
   cmdAdd('D', onKd,   "Kd");
@@ -1244,6 +1382,7 @@ void setup() {
 void loop() {
   if (estado == EST_ATIVO && motor_on) {
     motor.loopFOC();
+    wheel_vel = motor.shaft_velocity;
     motor.move(u_cmd);
     foc_count = foc_count + 1;
   } else {
@@ -1252,6 +1391,7 @@ void loop() {
       motor.disable();
       motor_on = false;
     }
+    wheel_vel = 0;
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
