@@ -33,13 +33,13 @@
   M2 = PID + pulsos (amplitude do pulso vinda do PID, mínimo C, máximo V)
   M3 = balanceamento por LQI (realimentação de estados + integrador na velocidade da roda):
          u = -(k1*theta + k2*dtheta + k3*w_roda + k4*z),  z = integral de (0 - w_roda)
-       Ganhos calculados no lqi_ganhos.py (modelo do Fusion). Ajuste fino: $1..$8. Saída em PULSOS (reversões de sentido, como o M2) e kick adaptativo (X) quando trava.
+       Ganhos calculados no lqi_ganhos.py (modelo do Fusion). Ajuste fino: $1..$10. Saída em PULSOS (reversões de sentido, como o M2) e kick adaptativo (X) quando trava.
 
   COMANDOS BLUETOOTH (digite no app de terminal serial BT, Enter após):
     !         DESLIGA o motor (vai para STANDBY).  !1 = desliga e entra em ECONOMIA já.
     @         LIGA o motor no modo atual.          @0 a @3 = liga já no modo escolhido.
     ^<s>      segundos sem comando até entrar em economia (padrão 120; 0 = nunca)
-    $         ganhos do LQI (M3): "$" mostra | $1 k1 | $2 k2 | $3 k3 | $4 k4 | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda (rad/s) | $8 pulsos 1/0
+    $         ganhos do LQI (M3): "$" mostra | $1 k1 | $2 k2 | $3 k3 | $4 k4 | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda (rad/s) | $8 pulsos 1/0 | $9 auto-trim | $10 dwell (ms)
     %<s>      desliga SOZINHO se ficar longe do setpoint (> 4 graus) por mais de <s> s (padrão 20; 0 = nunca)
     ~         AUTO-AJUSTE (twiddle) com o motor ligado: M1 = Kp,Kd,Ki | M2 = Kp,Kd,Ki,C | M3 = escalas dos ganhos k1..k4.  ~<s> = janela de <s> s por teste.
               ~0 cancela (mantém os melhores valores achados até ali). Depois use W para salvar.
@@ -374,6 +374,11 @@ float lqi_zmax_V = 2.0f;  // limite do termo integral k4*z (anti-windup), em V
 float lqi_dead_V = 0.3f;  // zona morta: se |u| < isto (V), a saída é zero            comando $6
 float lqi_wk     = 30.0f; // kick do M3: o recuo dura até a roda atingir esta velocidade (rad/s) comando $7
 float lqi_pulse  = 1.0f;  // 1 = pulsos (padrão) | 0 = contínuo                       comando $8
+float lqi_dwell_ms = 30.0f; // tempo mínimo entre reversões no M3 (o LQI é rápido: 60 ms é lento demais) comando $10
+// Auto-trim do setpoint: se o setpoint estiver errado, a roda precisa de torque constante e acelera sem parar ("rotação simples").
+// Aqui o setpoint é deslocado devagar na direção que zera a velocidade da roda: d(trim)/dt = lqi_trim * w.
+float lqi_trim   = 0.002f; // ganho (adimensional). 0 = desligado                         comando $9
+float lqi_sp_trim = 0;     // deslocamento aprendido do setpoint (rad), limitado a ±6 graus
 float lqi_z = 0;          // estado do integrador: z = integral de (0 - w_roda), em rad
 unsigned long t_prev_lqi = 0;
 float dbg_W = 0;          // contribuição do termo da roda (-k3*w), em V (log)
@@ -439,7 +444,7 @@ float tuneCost(const Metrics& m) {
 // ---- Telemetria (cópia atômica do último ciclo de controle) ----
 struct Telem {
   uint32_t t_ms; int modo; float ang, ang_acc, gz, err, P, I, D, pre, out; int sat, fallen;
-  float ax, ay, az; int clip; float W;
+  float ax, ay, az; int clip; float W; float trim;
 };
 Telem telem = {};
 portMUX_TYPE telMux = portMUX_INITIALIZER_UNLOCKED;
@@ -458,6 +463,7 @@ void resetPID() {
 void ctrlResetStates() {
   resetPID();
   kst = 0; kt0 = 0; tstuck = 0; pm_dir = 0; pm_t0 = 0; perda_t0 = 0;
+  lqi_sp_trim = 0;       // o trim aprendido é zerado junto (troca de modo, S, Z, R, ligar...)
 }
 void ctrlReset() { ctrl_reset_req = true; }     // pedido feito por qualquer tarefa
 
@@ -517,7 +523,7 @@ float computeLQI(float angle_rad, float gyro_rate_rads, float wheel_vel_rads) {
   t_prev_lqi = now;
   dt = constrain(dt, 1e-4f, 0.05f);
 
-  float theta  = angle_rad - setpoint_deg * DEG_TO_RAD;   // desvio em relação ao setpoint (rad)
+  float theta  = angle_rad - (setpoint_deg * DEG_TO_RAD + lqi_sp_trim);   // desvio em relação ao setpoint + trim (rad)
   float dtheta = gyro_rate_rads;                          // rad/s
   float w      = dir_motor * wheel_vel_rads;              // rad/s, no sentido de u
 
@@ -531,6 +537,9 @@ float computeLQI(float angle_rad, float gyro_rate_rads, float wheel_vel_rads) {
     return 0;
   }
   dbg_fallen = false;
+
+  // Auto-trim: roda girando para + => o setpoint estava abaixo do equilíbrio real; sobe-o (e vice-versa)
+  if (lqi_trim > 0) lqi_sp_trim = constrain(lqi_sp_trim + lqi_trim * w * dt, -0.105f, 0.105f);
 
   // Integrador: z = integral de (referência - saída), referência = roda parada
   float dz = (0.0f - w) * dt;
@@ -617,7 +626,7 @@ void ctrlStep() {
       if (lqi_pulse > 0.5f) {
         float mag  = fabsf(out_V);
         float want = (mag <= lqi_dead_V) ? 0.0f : (out_V > 0 ? 1.0f : -1.0f);
-        if (want != pm_dir && (now - pm_t0) >= (uint32_t)bb_dwell_ms) { pm_dir = want; pm_t0 = now; }
+        if (want != pm_dir && (now - pm_t0) >= (uint32_t)lqi_dwell_ms) { pm_dir = want; pm_t0 = now; }
         float vmin = min(bb_V, VOLTAGE_LIMIT_MAX);
         out_V = pm_dir * constrain(mag, vmin, VOLTAGE_LIMIT_MAX);
       }
@@ -690,7 +699,7 @@ void ctrlStep() {
   t.ang = angle_est * RAD_TO_DEG; t.ang_acc = ANGLE_SIGN * atan2f(s.ax, s.ay) * RAD_TO_DEG; t.gz = s.gz;
   t.err = dbg_err_deg; t.P = dbg_P; t.I = dbg_I; t.D = dbg_D; t.pre = dbg_pre; t.out = out_V;
   t.sat = dbg_sat ? 1 : 0; t.fallen = dbg_fallen ? 1 : 0;
-  t.ax = s.ax; t.ay = s.ay; t.az = s.az; t.W = dbg_W;
+  t.ax = s.ax; t.ay = s.ay; t.az = s.az; t.W = dbg_W; t.trim = lqi_sp_trim * RAD_TO_DEG;
   t.clip = (fabsf(s.ax) > 1.99f || fabsf(s.ay) > 1.99f || fabsf(s.az) > 1.99f) ? 1 : 0;
   portENTER_CRITICAL(&telMux); telem = t; portEXIT_CRITICAL(&telMux);
 }
@@ -949,7 +958,7 @@ void onInv(char* cmd) {
 }
 
 void printHeader() {
-  SerialBT.println("t_ms,modo,ang_deg,ang_acc_deg,gz_dps,erro_deg,P_V,I_V,D_V,pid_V,saida_V,sat,caido,vel_roda_rads,ax_g,ay_g,az_g,clip,ctrl_hz,foc_hz,mpu_falhas,W_V");
+  SerialBT.println("t_ms,modo,ang_deg,ang_acc_deg,gz_dps,erro_deg,P_V,I_V,D_V,pid_V,saida_V,sat,caido,vel_roda_rads,ax_g,ay_g,az_g,clip,ctrl_hz,foc_hz,mpu_falhas,W_V,trim_deg");
 }
 
 // F: troca o formato do log. F1 = CSV (para planilha/gráfico), F0 = texto legível. "F" alterna.
@@ -1015,14 +1024,15 @@ void onHelp(char* cmd) {
   SerialBT.println("ctrl_hz     voltas da tarefa de controle por segundo (ideal ~500)");
   SerialBT.println("foc_hz      voltas do loop FOC por segundo (ideal > 2000)");
   SerialBT.println("mpu_falhas  leituras do MPU que falharam");
-  SerialBT.println("W_V         (ultima coluna) em M3: -k3*w_roda (V)");
+  SerialBT.println("W_V         em M3: -k3*w_roda (V)");
+  SerialBT.println("trim_deg    (ultima coluna) em M3: deslocamento aprendido do setpoint (graus). setpoint real = S + trim");
   SerialBT.println("--- COMANDOS ---");
   SerialBT.println("! desliga motor (!1 = ja em economia) | @ liga (@0..@3 escolhe modo) | ^<s> tempo p/ economia | %<s> auto-desligar");
   SerialBT.println("~ auto-ajuste do PID (~<s> janela, ~0 cancela) | W salva | Y apaga salvos");
   SerialBT.println("M0/M1/M2/M3 modo | K I D ganhos | S setpoint | Z setpoint=angulo atual | R inverte motor");
   SerialBT.println("L<seg> log (L0 para) | F formato | T<hz> taxa | B bias giro | Q status | H ajuda");
   SerialBT.println("M2 = PID + pulsos: C amplitude minima | N zona morta (graus) | O dwell (ms)");
-  SerialBT.println("M3 = LQI: $ mostra | $1..$4 ganhos | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda (rad/s) | $8 pulsos 1/0 (usa C e O)");
+  SerialBT.println("M3 = LQI: $ mostra | $1..$4 ganhos | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda | $8 pulsos 1/0 | $9 auto-trim | $10 dwell M3 (ms)");
   SerialBT.println("kick (M1, M2 e M3): X<V> (X0 desliga) | G espera (ms) | U |gz| parado (dps) | E recuo (ms)");
   SerialBT.println("limites: V<V> tensao max (<=8) | J integrador (V) | #<V> tensao da fonte");
 }
@@ -1073,14 +1083,18 @@ void onLQI(char* cmd) {
       case 6: lqi_dead_V = constrain(val, 0.0f, 2.0f); break;
       case 7: lqi_wk = constrain(val, 5.0f, 150.0f); break;
       case 8: lqi_pulse = (val > 0.5f) ? 1.0f : 0.0f; break;
+      case 9: lqi_trim = constrain(val, 0.0f, 0.05f); break;
+      case 10: lqi_dwell_ms = constrain(val, 5.0f, 500.0f); break;
       default: SerialBT.println("use $1..$5"); return;
     }
     ctrlReset();   // zera o integrador ao mudar ganho
   }
   SerialBT.printf("LQI: k1=%.3f V/rad (%.3f V/grau)  k2=%.3f  k3=%.4f  k4=%.4f  lim_int=%.2f V\n",
                   lqi_k1, lqi_k1 * DEG_TO_RAD, lqi_k2, lqi_k3, lqi_k4, lqi_zmax_V);
-  SerialBT.printf("LQI saida: %s  zona_morta($6)=%.2f V  kick_roda($7)=%.0f rad/s  (C=%.2f V, O=%.0f ms valem tambem aqui)\n",
-                  lqi_pulse > 0.5f ? "PULSOS" : "continua", lqi_dead_V, lqi_wk, bb_V, bb_dwell_ms);
+  SerialBT.printf("LQI saida: %s  zona_morta($6)=%.2f V  kick_roda($7)=%.0f rad/s  (C=%.2f V valem tambem aqui)\n",
+                  lqi_pulse > 0.5f ? "PULSOS" : "continua", lqi_dead_V, lqi_wk, bb_V);
+  SerialBT.printf("LQI pulsos: dwell($10)=%.0f ms | auto-trim($9)=%.4f (0 = off): trim atual=%+.2f deg -> equilibrio estimado = %.2f deg (setpoint S=%.2f)\n",
+                  lqi_dwell_ms, lqi_trim, lqi_sp_trim * RAD_TO_DEG, setpoint_deg + lqi_sp_trim * RAD_TO_DEG, setpoint_deg);
 }
 
 // #<volts>: tensão de alimentação (6 a 16 V). Ex.: "#12.4". Sem argumento só mostra. W salva.
@@ -1175,6 +1189,8 @@ void loadParams() {
     lqi_dead_V = constrain(prefs.getFloat("l6", lqi_dead_V), 0.0f, 2.0f);
     lqi_wk = constrain(prefs.getFloat("l7", lqi_wk), 5.0f, 150.0f);
     lqi_pulse = prefs.getFloat("l8", lqi_pulse) > 0.5f ? 1.0f : 0.0f;
+    lqi_trim = constrain(prefs.getFloat("l9", lqi_trim), 0.0f, 0.05f);
+    lqi_dwell_ms = constrain(prefs.getFloat("l10", lqi_dwell_ms), 5.0f, 500.0f);
     gyro_bias_z = prefs.getFloat("bias", gyro_bias_z);
     telem_hz = constrain(prefs.getFloat("thz", telem_hz), 1.0f, 50.0f);
     fmt_csv = prefs.getBool("csv", fmt_csv);
@@ -1215,6 +1231,8 @@ void onSave(char* cmd) {
   prefs.putFloat("l6", lqi_dead_V);
   prefs.putFloat("l7", lqi_wk);
   prefs.putFloat("l8", lqi_pulse);
+  prefs.putFloat("l9", lqi_trim);
+  prefs.putFloat("l10", lqi_dwell_ms);
   prefs.putFloat("bias", gyro_bias_z);
   prefs.putFloat("thz", telem_hz);
   prefs.putBool("csv", fmt_csv);
@@ -1293,16 +1311,16 @@ void comStep() {
       int n;
       if (fmt_csv) {
         n = snprintf(buf, sizeof(buf),
-                     "%lu,%d,%.2f,%.2f,%.1f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.2f,%.3f,%.3f,%.3f,%d,%.0f,%.0f,%lu,%.3f\n",
+                     "%lu,%d,%.2f,%.2f,%.1f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.2f,%.3f,%.3f,%.3f,%d,%.0f,%.0f,%lu,%.3f,%.2f\n",
                      (unsigned long)t.t_ms, t.modo, t.ang, t.ang_acc, t.gz, t.err,
                      t.P, t.I, t.D, t.pre, t.out, t.sat, t.fallen,
-                     vel, t.ax, t.ay, t.az, t.clip, (float)ctrl_hz, (float)foc_hz, (unsigned long)mpu_falhas, t.W);
+                     vel, t.ax, t.ay, t.az, t.clip, (float)ctrl_hz, (float)foc_hz, (unsigned long)mpu_falhas, t.W, t.trim);
       } else {
         n = snprintf(buf, sizeof(buf),
-                     "t=%.2fs M%d | ang=%+.2f acc=%+.2f gz=%+.1f erro=%+.2f | P=%+.3f I=%+.3f D=%+.3f pid=%+.3f OUT=%+.3fV SAT=%d CAIDO=%d | roda=%+.2f rad/s | a=(%+.2f,%+.2f,%+.2f)g CLIP=%d | ctrl=%.0fHz foc=%.0fHz falhas=%lu W=%+.3f\n",
+                     "t=%.2fs M%d | ang=%+.2f acc=%+.2f gz=%+.1f erro=%+.2f | P=%+.3f I=%+.3f D=%+.3f pid=%+.3f OUT=%+.3fV SAT=%d CAIDO=%d | roda=%+.2f rad/s | a=(%+.2f,%+.2f,%+.2f)g CLIP=%d | ctrl=%.0fHz foc=%.0fHz falhas=%lu W=%+.3f trim=%+.2f\n",
                      t.t_ms / 1000.0f, t.modo, t.ang, t.ang_acc, t.gz, t.err,
                      t.P, t.I, t.D, t.pre, t.out, t.sat, t.fallen,
-                     vel, t.ax, t.ay, t.az, t.clip, (float)ctrl_hz, (float)foc_hz, (unsigned long)mpu_falhas, t.W);
+                     vel, t.ax, t.ay, t.az, t.clip, (float)ctrl_hz, (float)foc_hz, (unsigned long)mpu_falhas, t.W, t.trim);
       }
       if (n > (int)sizeof(buf) - 1) n = sizeof(buf) - 1;
       SerialBT.write((const uint8_t*)buf, n);
