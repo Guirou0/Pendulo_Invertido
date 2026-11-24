@@ -33,13 +33,13 @@
   M2 = PID + pulsos (amplitude do pulso vinda do PID, mínimo C, máximo V)
   M3 = balanceamento por LQI (realimentação de estados + integrador na velocidade da roda):
          u = -(k1*theta + k2*dtheta + k3*w_roda + k4*z),  z = integral de (0 - w_roda)
-       Ganhos calculados no lqi_ganhos.py (modelo do Fusion). Ajuste fino: $1..$10. Saída em PULSOS (reversões de sentido, como o M2) e kick adaptativo (X) quando trava.
+       Ganhos calculados no lqi_ganhos.py (modelo do Fusion). Ajuste fino: $1..$11. Saída em PULSOS (reversões de sentido, como o M2) e kick adaptativo (X) quando trava.
 
   COMANDOS BLUETOOTH (digite no app de terminal serial BT, Enter após):
     !         DESLIGA o motor (vai para STANDBY).  !1 = desliga e entra em ECONOMIA já.
     @         LIGA o motor no modo atual.          @0 a @3 = liga já no modo escolhido.
     ^<s>      segundos sem comando até entrar em economia (padrão 120; 0 = nunca)
-    $         ganhos do LQI (M3): "$" mostra | $1 k1 | $2 k2 | $3 k3 | $4 k4 | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda (rad/s) | $8 pulsos 1/0 | $9 auto-trim | $10 dwell (ms)
+    $         ganhos do LQI (M3): "$" mostra | $1 k1 | $2 k2 | $3 k3 | $4 k4 | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda (rad/s) | $8 pulsos 1/0 | $9 auto-trim | $10 dwell (ms) | $11 limite do termo da roda (V)
     %<s>      desliga SOZINHO se ficar longe do setpoint (> 4 graus) por mais de <s> s (padrão 20; 0 = nunca)
     ~         AUTO-AJUSTE (twiddle) com o motor ligado: M1 = Kp,Kd,Ki | M2 = Kp,Kd,Ki,C | M3 = escalas dos ganhos k1..k4.  ~<s> = janela de <s> s por teste.
               ~0 cancela (mantém os melhores valores achados até ali). Depois use W para salvar.
@@ -377,7 +377,10 @@ float lqi_pulse  = 1.0f;  // 1 = pulsos (padrão) | 0 = contínuo               
 float lqi_dwell_ms = 30.0f; // tempo mínimo entre reversões no M3 (o LQI é rápido: 60 ms é lento demais) comando $10
 // Auto-trim do setpoint: se o setpoint estiver errado, a roda precisa de torque constante e acelera sem parar ("rotação simples").
 // Aqui o setpoint é deslocado devagar na direção que zera a velocidade da roda: d(trim)/dt = lqi_trim * w.
-float lqi_trim   = 0.002f; // ganho (adimensional). 0 = desligado                         comando $9
+float lqi_trim   = 0.0f;   // ganho (adimensional). 0 = DESLIGADO (padrão). Só age com a haste calma perto do alvo  comando $9
+// Limite do termo da roda (-k3*w) em volts. Sem limite ele chega a 22 V com a roda saturada e decide sozinho o sentido da saída
+// (a roda trava girando). Limitado, o sentido volta a ser decidido pelo ângulo e pelo giroscópio, como no PID.   comando $11 (0 = sem limite)
+float lqi_wcap   = 1.5f;
 float lqi_sp_trim = 0;     // deslocamento aprendido do setpoint (rad), limitado a ±6 graus
 float lqi_z = 0;          // estado do integrador: z = integral de (0 - w_roda), em rad
 unsigned long t_prev_lqi = 0;
@@ -539,7 +542,9 @@ float computeLQI(float angle_rad, float gyro_rate_rads, float wheel_vel_rads) {
   dbg_fallen = false;
 
   // Auto-trim: roda girando para + => o setpoint estava abaixo do equilíbrio real; sobe-o (e vice-versa)
-  if (lqi_trim > 0) lqi_sp_trim = constrain(lqi_sp_trim + lqi_trim * w * dt, -0.105f, 0.105f);
+  // (só com a haste calma e perto do alvo: durante quedas/batidas a velocidade da roda não diz nada sobre o equilíbrio)
+  if (lqi_trim > 0 && fabsf(theta) < 0.052f && fabsf(dtheta) < 0.35f)
+    lqi_sp_trim = constrain(lqi_sp_trim + lqi_trim * w * dt, -0.105f, 0.105f);
 
   // Integrador: z = integral de (referência - saída), referência = roda parada
   float dz = (0.0f - w) * dt;
@@ -553,6 +558,7 @@ float computeLQI(float angle_rad, float gyro_rate_rads, float wheel_vel_rads) {
   float uP = -lqi_k1 * theta;     // ângulo
   float uD = -lqi_k2 * dtheta;    // velocidade da haste
   float uW = -lqi_k3 * w;         // velocidade da roda
+  if (lqi_wcap > 0.01f) uW = constrain(uW, -lqi_wcap, lqi_wcap);
   float uI = -lqi_k4 * lqi_z;     // integral
   float u  = uP + uD + uW + uI;
 
@@ -1032,7 +1038,7 @@ void onHelp(char* cmd) {
   SerialBT.println("M0/M1/M2/M3 modo | K I D ganhos | S setpoint | Z setpoint=angulo atual | R inverte motor");
   SerialBT.println("L<seg> log (L0 para) | F formato | T<hz> taxa | B bias giro | Q status | H ajuda");
   SerialBT.println("M2 = PID + pulsos: C amplitude minima | N zona morta (graus) | O dwell (ms)");
-  SerialBT.println("M3 = LQI: $ mostra | $1..$4 ganhos | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda | $8 pulsos 1/0 | $9 auto-trim | $10 dwell M3 (ms)");
+  SerialBT.println("M3 = LQI: $ mostra | $1..$4 ganhos | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda | $8 pulsos 1/0 | $9 auto-trim | $10 dwell | $11 limite termo roda (V)");
   SerialBT.println("kick (M1, M2 e M3): X<V> (X0 desliga) | G espera (ms) | U |gz| parado (dps) | E recuo (ms)");
   SerialBT.println("limites: V<V> tensao max (<=8) | J integrador (V) | #<V> tensao da fonte");
 }
@@ -1085,6 +1091,7 @@ void onLQI(char* cmd) {
       case 8: lqi_pulse = (val > 0.5f) ? 1.0f : 0.0f; break;
       case 9: lqi_trim = constrain(val, 0.0f, 0.05f); break;
       case 10: lqi_dwell_ms = constrain(val, 5.0f, 500.0f); break;
+      case 11: lqi_wcap = constrain(val, 0.0f, 20.0f); break;
       default: SerialBT.println("use $1..$5"); return;
     }
     ctrlReset();   // zera o integrador ao mudar ganho
@@ -1093,6 +1100,7 @@ void onLQI(char* cmd) {
                   lqi_k1, lqi_k1 * DEG_TO_RAD, lqi_k2, lqi_k3, lqi_k4, lqi_zmax_V);
   SerialBT.printf("LQI saida: %s  zona_morta($6)=%.2f V  kick_roda($7)=%.0f rad/s  (C=%.2f V valem tambem aqui)\n",
                   lqi_pulse > 0.5f ? "PULSOS" : "continua", lqi_dead_V, lqi_wk, bb_V);
+  SerialBT.printf("LQI termo da roda limitado a %.2f V ($11, 0 = sem limite)\n", lqi_wcap);
   SerialBT.printf("LQI pulsos: dwell($10)=%.0f ms | auto-trim($9)=%.4f (0 = off): trim atual=%+.2f deg -> equilibrio estimado = %.2f deg (setpoint S=%.2f)\n",
                   lqi_dwell_ms, lqi_trim, lqi_sp_trim * RAD_TO_DEG, setpoint_deg + lqi_sp_trim * RAD_TO_DEG, setpoint_deg);
 }
@@ -1191,6 +1199,7 @@ void loadParams() {
     lqi_pulse = prefs.getFloat("l8", lqi_pulse) > 0.5f ? 1.0f : 0.0f;
     lqi_trim = constrain(prefs.getFloat("l9", lqi_trim), 0.0f, 0.05f);
     lqi_dwell_ms = constrain(prefs.getFloat("l10", lqi_dwell_ms), 5.0f, 500.0f);
+    lqi_wcap = constrain(prefs.getFloat("l11", lqi_wcap), 0.0f, 20.0f);
     gyro_bias_z = prefs.getFloat("bias", gyro_bias_z);
     telem_hz = constrain(prefs.getFloat("thz", telem_hz), 1.0f, 50.0f);
     fmt_csv = prefs.getBool("csv", fmt_csv);
@@ -1233,6 +1242,7 @@ void onSave(char* cmd) {
   prefs.putFloat("l8", lqi_pulse);
   prefs.putFloat("l9", lqi_trim);
   prefs.putFloat("l10", lqi_dwell_ms);
+  prefs.putFloat("l11", lqi_wcap);
   prefs.putFloat("bias", gyro_bias_z);
   prefs.putFloat("thz", telem_hz);
   prefs.putBool("csv", fmt_csv);
