@@ -33,13 +33,13 @@
   M2 = PID + pulsos (amplitude do pulso vinda do PID, mínimo C, máximo V)
   M3 = balanceamento por LQI (realimentação de estados + integrador na velocidade da roda):
          u = -(k1*theta + k2*dtheta + k3*w_roda + k4*z),  z = integral de (0 - w_roda)
-       Ganhos calculados no lqi_ganhos.py (modelo do Fusion). Ajuste fino: $1..$11. Saída em PULSOS (reversões de sentido, como o M2) e kick adaptativo (X) quando trava.
+       Ganhos calculados no lqi_ganhos.py (modelo do Fusion). Ajuste fino: $1..$12. Saída em PULSOS (reversões de sentido, como o M2) e kick adaptativo (X) quando trava.
 
   COMANDOS BLUETOOTH (digite no app de terminal serial BT, Enter após):
     !         DESLIGA o motor (vai para STANDBY).  !1 = desliga e entra em ECONOMIA já.
     @         LIGA o motor no modo atual.          @0 a @3 = liga já no modo escolhido.
     ^<s>      segundos sem comando até entrar em economia (padrão 120; 0 = nunca)
-    $         ganhos do LQI (M3): "$" mostra | $1 k1 | $2 k2 | $3 k3 | $4 k4 | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda (rad/s) | $8 pulsos 1/0 | $9 auto-trim | $10 dwell (ms) | $11 limite do termo da roda (V)
+    $         ganhos do LQI (M3): "$" mostra | $1 k1 | $2 k2 | $3 k3 | $4 k4 | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda (rad/s) | $8 pulsos 1/0 | $9 auto-trim | $10 dwell (ms) | $11 limite do termo da roda (V) | $12 kick por roda saturada (rad/s)
     %<s>      desliga SOZINHO se ficar longe do setpoint (> 4 graus) por mais de <s> s (padrão 20; 0 = nunca)
     ~         AUTO-AJUSTE (twiddle) com o motor ligado: M1 = Kp,Kd,Ki | M2 = Kp,Kd,Ki,C | M3 = escalas dos ganhos k1..k4.  ~<s> = janela de <s> s por teste.
               ~0 cancela (mantém os melhores valores achados até ali). Depois use W para salvar.
@@ -381,6 +381,7 @@ float lqi_trim   = 0.0f;   // ganho (adimensional). 0 = DESLIGADO (padrão). Só
 // Limite do termo da roda (-k3*w) em volts. Sem limite ele chega a 22 V com a roda saturada e decide sozinho o sentido da saída
 // (a roda trava girando). Limitado, o sentido volta a ser decidido pelo ângulo e pelo giroscópio, como no PID.   comando $11 (0 = sem limite)
 float lqi_wcap   = 1.5f;
+float lqi_wsat   = 60.0f;  // kick por roda saturada (M3): |velocidade da roda| acima disso, no sentido da saída, com erro > 2°  comando $12 (0 = desliga)
 float lqi_sp_trim = 0;     // deslocamento aprendido do setpoint (rad), limitado a ±6 graus
 float lqi_z = 0;          // estado do integrador: z = integral de (0 - w_roda), em rad
 unsigned long t_prev_lqi = 0;
@@ -407,7 +408,9 @@ bool bias_cal = false; double bias_soma = 0; uint32_t bias_cnt = 0, bias_fim_ms 
 float    pm_dir = 0;
 uint32_t pm_t0 = 0;
 uint8_t  kst = 0;                 // kick: 0 = normal, 1 = recuo, 2 = pulso
-uint32_t kt0 = 0, tstuck = 0;
+uint32_t kt0 = 0, tstuck = 0, tsatlock = 0;
+float    gz_lp = 0;               // giro filtrado (passa-baixa 100 ms), °/s — usado pelo detector de 'parado' do M3
+uint32_t t_gz_lp = 0;
 float    ksign = 1;               // sentido da SUBIDA do kick
 uint32_t perda_t0 = 0;
 unsigned long t_ultima_troca = 0;
@@ -620,6 +623,11 @@ void ctrlStep() {
   float md = modo;
   if (estado == EST_ATIVO && !bias_cal) {
     float gyro_rate_rads = GYRO_SIGN * s.gz * DEG_TO_RAD;
+    {   // passa-baixa do giro para o detector de 'parado'
+      float dtl = (t_gz_lp == 0) ? 0.002f : (now - t_gz_lp) * 1e-3f;
+      t_gz_lp = now;
+      gz_lp += (s.gz - gz_lp) * (dtl / (0.1f + dtl));
+    }
 
     if (md < 0.5f) {
       // ---- Modo M0: teste em malha aberta (onda quadrada) ----
@@ -660,12 +668,24 @@ void ctrlStep() {
     // máxima da tensão e não gera mais torque. O kick recua a roda e depois inverte para o lado da subida.
     if (md >= 0.5f && kick_V > 0.01f) {
       if (kst == 0) {
-        bool travado = !dbg_fallen && fabsf(dbg_err_deg) > KICK_ERR_DEG && fabsf(s.gz) < kick_gz_dps;
+        // "Parado": no M3 usa o giro FILTRADO (passa-baixa de 100 ms), porque a vibração da roda a ~12 Hz mantém o |gz| bruto
+        // acima de 15 °/s e o contador zerava para sempre (log de 24/11: nenhum kick em 12 s travado). Nos outros modos, giro bruto.
+        float gz_teste = (md > 2.5f) ? gz_lp : s.gz;
+        bool travado = !dbg_fallen && fabsf(dbg_err_deg) > KICK_ERR_DEG && fabsf(gz_teste) < kick_gz_dps;
+        // M3: roda saturada empurrando no mesmo sentido da saída com a haste fora do alvo: não há mais torque a ganhar,
+        // só a reversão (kick) resolve. Dispara sem esperar a haste parar. ($12 = velocidade da roda em rad/s; 0 = desliga)
+        bool satlock = (md > 2.5f) && lqi_wsat > 1.0f && !dbg_fallen && fabsf(dbg_err_deg) > 2.0f &&
+                       fabsf(wheel_vel) > lqi_wsat && (out_V * wheel_vel) > 0;
+        if (!satlock) tsatlock = 0;
+        else if (tsatlock == 0) tsatlock = now;
+        bool fire = false;
         if (!travado) tstuck = 0;
         else if (tstuck == 0) tstuck = now;
-        else if (now - tstuck > (uint32_t)kick_wait_ms && now - kt0 > KICK_COOLDOWN_MS) {
+        else if (now - tstuck > (uint32_t)kick_wait_ms) fire = true;
+        if (satlock && now - tsatlock > 100) fire = true;
+        if (fire && now - kt0 > KICK_COOLDOWN_MS) {
           ksign = ((dbg_err_deg > 0) ? 1.0f : -1.0f) * dir_motor;
-          kst = 1; kt0 = now; tstuck = 0;
+          kst = 1; kt0 = now; tstuck = 0; tsatlock = 0;
           kick_evt = kick_evt + 1;
           metricsKick();
         }
@@ -1038,7 +1058,7 @@ void onHelp(char* cmd) {
   SerialBT.println("M0/M1/M2/M3 modo | K I D ganhos | S setpoint | Z setpoint=angulo atual | R inverte motor");
   SerialBT.println("L<seg> log (L0 para) | F formato | T<hz> taxa | B bias giro | Q status | H ajuda");
   SerialBT.println("M2 = PID + pulsos: C amplitude minima | N zona morta (graus) | O dwell (ms)");
-  SerialBT.println("M3 = LQI: $ mostra | $1..$4 ganhos | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda | $8 pulsos 1/0 | $9 auto-trim | $10 dwell | $11 limite termo roda (V)");
+  SerialBT.println("M3 = LQI: $ mostra | $1..$4 ganhos | $5 limite integral (V) | $6 zona morta (V) | $7 kick roda | $8 pulsos 1/0 | $9 auto-trim | $10 dwell | $11 limite termo roda (V) | $12 kick roda saturada");
   SerialBT.println("kick (M1, M2 e M3): X<V> (X0 desliga) | G espera (ms) | U |gz| parado (dps) | E recuo (ms)");
   SerialBT.println("limites: V<V> tensao max (<=8) | J integrador (V) | #<V> tensao da fonte");
 }
@@ -1092,6 +1112,7 @@ void onLQI(char* cmd) {
       case 9: lqi_trim = constrain(val, 0.0f, 0.05f); break;
       case 10: lqi_dwell_ms = constrain(val, 5.0f, 500.0f); break;
       case 11: lqi_wcap = constrain(val, 0.0f, 20.0f); break;
+      case 12: lqi_wsat = constrain(val, 0.0f, 150.0f); break;
       default: SerialBT.println("use $1..$5"); return;
     }
     ctrlReset();   // zera o integrador ao mudar ganho
@@ -1100,7 +1121,7 @@ void onLQI(char* cmd) {
                   lqi_k1, lqi_k1 * DEG_TO_RAD, lqi_k2, lqi_k3, lqi_k4, lqi_zmax_V);
   SerialBT.printf("LQI saida: %s  zona_morta($6)=%.2f V  kick_roda($7)=%.0f rad/s  (C=%.2f V valem tambem aqui)\n",
                   lqi_pulse > 0.5f ? "PULSOS" : "continua", lqi_dead_V, lqi_wk, bb_V);
-  SerialBT.printf("LQI termo da roda limitado a %.2f V ($11, 0 = sem limite)\n", lqi_wcap);
+  SerialBT.printf("LQI termo da roda limitado a %.2f V ($11, 0 = sem limite) | kick por roda saturada acima de %.0f rad/s ($12, 0 = off)\n", lqi_wcap, lqi_wsat);
   SerialBT.printf("LQI pulsos: dwell($10)=%.0f ms | auto-trim($9)=%.4f (0 = off): trim atual=%+.2f deg -> equilibrio estimado = %.2f deg (setpoint S=%.2f)\n",
                   lqi_dwell_ms, lqi_trim, lqi_sp_trim * RAD_TO_DEG, setpoint_deg + lqi_sp_trim * RAD_TO_DEG, setpoint_deg);
 }
@@ -1200,6 +1221,7 @@ void loadParams() {
     lqi_trim = constrain(prefs.getFloat("l9", lqi_trim), 0.0f, 0.05f);
     lqi_dwell_ms = constrain(prefs.getFloat("l10", lqi_dwell_ms), 5.0f, 500.0f);
     lqi_wcap = constrain(prefs.getFloat("l11", lqi_wcap), 0.0f, 20.0f);
+    lqi_wsat = constrain(prefs.getFloat("l12", lqi_wsat), 0.0f, 150.0f);
     gyro_bias_z = prefs.getFloat("bias", gyro_bias_z);
     telem_hz = constrain(prefs.getFloat("thz", telem_hz), 1.0f, 50.0f);
     fmt_csv = prefs.getBool("csv", fmt_csv);
@@ -1243,6 +1265,7 @@ void onSave(char* cmd) {
   prefs.putFloat("l9", lqi_trim);
   prefs.putFloat("l10", lqi_dwell_ms);
   prefs.putFloat("l11", lqi_wcap);
+  prefs.putFloat("l12", lqi_wsat);
   prefs.putFloat("bias", gyro_bias_z);
   prefs.putFloat("thz", telem_hz);
   prefs.putBool("csv", fmt_csv);
